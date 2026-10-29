@@ -6,6 +6,7 @@ them, and the two Harbour Bank repositories. Every list is capped and every wind
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
@@ -22,6 +23,7 @@ MAX_LOG_LINES = 500
 MAX_WINDOW_MINUTES = 24 * 60
 MAX_SERIES = 50
 MAX_POINTS = 120
+AUDIT_WORKERS = 8         # parallel GitHub lookups in change_audit, well under its rate limits
 QUIET_ALERTS = {"Watchdog", "InfoInhibitor"}    # always firing by design
 NAME = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$")   # a Kubernetes object name
 
@@ -501,8 +503,8 @@ def change_audit(gh: GitHub, repo: Literal["gitops", "app"] = "gitops", days: in
     full = REPOS[repo]
     period = "day" if days <= 1 else "week" if days <= 7 else "month"
     suites = gh.get(f"/repos/{full}/rulesets/rule-suites", ref="refs/heads/main", time_period=period)
-    entries = []
-    for s in suites[:20]:
+
+    def push(s: dict) -> dict:
         entry = {"pushed_at": s.get("pushed_at"), "actor": s.get("actor_name"), "result": s.get("result"),
                  "evaluation": s.get("evaluation_result"),
                  "change": f"{(s.get('before_sha') or '')[:7]} -> {(s.get('after_sha') or '')[:7]}"}
@@ -512,7 +514,12 @@ def change_audit(gh: GitHub, repo: Literal["gitops", "app"] = "gitops", days: in
                 entry["pull_request"] = _pull_request(gh, full, pulls[0]["number"])
         except ApiError as exc:
             entry["pull_request_error"] = str(exc)
-        entries.append(entry)
+        return entry
+
+    # Three GitHub calls per push, independent of each other: run them side by side (30 s -> a few).
+    # map() keeps the order, so the newest push stays first.
+    with ThreadPoolExecutor(max_workers=AUDIT_WORKERS) as pool:
+        entries = list(pool.map(push, suites[:20]))
     return {"repo": full, "period": period, "pushes_to_main": entries,
             "how_to_read": "result 'pass' = the rules were met (e.g. an approved PR); 'bypass' = an admin "
                            "overrode them and GitHub recorded it; 'fail' = the push was blocked"}
