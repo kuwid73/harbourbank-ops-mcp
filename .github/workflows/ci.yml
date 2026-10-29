@@ -1,0 +1,38 @@
+# Harbour Bank ops MCP server pipeline: lint + tests on every PR and push to main.
+# The tests include the safety properties: only GET requests, masking, scope and size limits,
+# and refusing to start under any identity but harbourbank-observer.
+#
+# Third-party actions are pinned to full commit SHAs (tags can be moved to malicious code)
+# and to releases at least two weeks old.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.11.33"
+          enable-cache: true
+      - name: Install dependencies (exactly as locked)
+        run: uv sync --locked
+      - name: Lint
+        run: uv run ruff check --output-format github .
+      - name: Tests
+        run: uv run pytest -q
