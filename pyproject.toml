@@ -1,0 +1,39 @@
+[project]
+name = "harbourbank-ops-mcp"
+version = "0.1.0"
+description = "Read-only MCP server for operating Harbour Bank (fictional bank, synthetic data)"
+requires-python = ">=3.13"
+dependencies = [
+    "httpx>=0.28.1",
+    "mcp>=2.3.0",
+    "pyyaml>=6.0.3",
+]
+
+[project.scripts]
+harbourbank-ops-mcp = "harbourbank_ops_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/harbourbank_ops_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+# pyflakes, pycodestyle, import order, modern syntax, bugbear, simplify, blind except
+select = ["F", "E", "W", "I", "UP", "B", "SIM", "BLE"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["harbourbank_ops_mcp", "conftest"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "ruff>=0.17.3",
+]
