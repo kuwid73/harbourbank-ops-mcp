@@ -1,3 +1,4 @@
+import time
 from datetime import UTC, datetime, timedelta
 
 import anyio
@@ -159,6 +160,32 @@ def test_end_of_day_status_reads_the_published_results(fake, kube):
 def test_end_of_day_status_before_any_run(kube):
     result = ops.end_of_day_status(kube, "dev")
     assert result["books_balance"] is None and "no end-of-day run" in result["note"]
+
+
+def test_change_audit_keeps_the_newest_push_first_when_lookups_finish_out_of_order(fake, gh):
+    repo = "/repos/kuwid73/harbourbank-gitops"
+    fake.routes[f"{repo}/rulesets/rule-suites"] = [
+        {"pushed_at": ts(i), "actor_name": "kuwid73", "result": "bypass", "before_sha": f"b{i}", "after_sha": f"a{i}"}
+        for i in range(5)]
+
+    def pulls_for(number, delay):
+        def route(request):
+            time.sleep(delay)   # the newest push's lookup finishes last
+            return [{"number": number}]
+        return route
+
+    for i in range(5):
+        n = 20 - i
+        fake.routes[f"{repo}/commits/a{i}/pulls"] = pulls_for(n, 0.2 if i == 0 else 0)
+        fake.routes[f"{repo}/pulls/{n}"] = {"title": f"PR {n}", "user": {"login": "kuwid73"},
+                                            "merged_by": {"login": "kuwid73"}, "merged_at": ts(i)}
+        fake.routes[f"{repo}/pulls/{n}/reviews"] = [{"user": {"login": "reviewer"}, "state": "APPROVED"}]
+
+    result = ops.change_audit(gh)
+
+    assert [(p["change"], p["pull_request"]["number"]) for p in result["pushes_to_main"]] == [
+        (f"b{i} -> a{i}", 20 - i) for i in range(5)]
+    assert result["pushes_to_main"][0]["pull_request"]["reviews"] == ["reviewer: APPROVED"]
 
 
 # --- identity ---------------------------------------------------------------------------
