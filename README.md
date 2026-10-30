@@ -18,14 +18,14 @@ It fetches facts. It does no reasoning of its own (there's no LLM inside) and it
 |---|---|
 | `bank_status` | each environment on one page: ArgoCD sync/health and last deployment (with its smoke test), accounts-api version and replicas, database, last business day closed, ledger imbalance, firing alerts |
 | `find_problems` | what's wrong now: unhealthy apps, crash-looping/pending/unready pods, recent restarts, failed Jobs, stuck rollouts, databases, nodes, alerts, warning events. Each comes with evidence and a suggested next call |
-| `describe_workload` | one Deployment, CronJob, Job or Pod: images, replicas, conditions, pods, recent runs, events |
+| `describe_workload` | one Deployment, CronJob, Job or Pod: images, replicas, conditions, pods (and where each pod's image came from), recent runs (scheduled or manual, retries), events |
 | `get_logs` | recent logs of a pod, Deployment or Job (or the previous container, where a crash's cause is) |
-| `search_logs` | stored logs and the Kubernetes event history (Loki), across environments, up to 7 days back |
+| `search_logs` | stored logs, the Kubernetes event history, and ArgoCD's events about the Harbour Bank apps (Loki), across environments, up to 7 days back |
 | `query_metrics` | any PromQL query, current or as a time series |
-| `recent_changes` | deployments to an environment, each with its Git commit and pull request (author, merger, reviews) |
+| `recent_changes` | deployments to an environment: every commit each one shipped, where each commit lands, who made it (human or CI), and its pull request (merger, reviews, independent approval) |
 | `compare_environments` | what's in one environment's build that another doesn't have yet |
-| `end_of_day_status` | the nightly batch: business day closed, interest paid, whether the books balance, recent runs and their results |
-| `change_audit` | GitHub's record of every push to `main`: rules passed or bypassed, by whom, with the PR's reviews |
+| `end_of_day_status` | the nightly batch: business day closed, interest paid, whether the books balance, the next run, recent runs (scheduled or manual, how late, retries), and every failed attempt's error |
+| `change_audit` | GitHub's record of every push to `main`: rules passed, bypassed or blocked; who really made each change (a CI deploy key pushes as the repo owner); the PR's reviews; when the rules came into force |
 
 ## Safety model
 
@@ -70,6 +70,20 @@ Add this to `claude_desktop_config.json` (Settings → Developer → Edit Config
   }
 }
 ```
+
+## Demo: masking
+
+Harbour Bank's logs contain no personal data (the API logs route templates, not values), so masking
+has nothing to do in normal operation. To show it working, plant one line of *synthetic* personal data
+in dev, ask Claude Desktop to search dev's logs for `app planted-leak`, then remove it:
+
+```bash
+./demo/planted-leak.sh plant     # prints the raw line, as stored
+./demo/planted-leak.sh remove
+```
+
+The answer shows `p***@sim.harbourbank.example` and `HB******4242`, and the audit log holds neither
+raw value. Tell the audience the line was planted.
 
 ## Development
 

@@ -36,6 +36,11 @@ def pod(name, phase="Running", ready=True, waiting=None, last=None, restarts=0):
             "containers": [{"image": IMAGE}]}, "status": status}
 
 
+def commit(title, author="Kumudu Widyaratne", email="53670161+kuwid73@users.noreply.github.com", files=()):
+    return {"commit": {"message": title, "committer": {"date": ts()}, "author": {"name": author, "email": email}},
+            "files": [{"filename": f} for f in files]}
+
+
 def argo_app(sync="Synced", health="Healthy", phase="Succeeded"):
     return {"status": {"sync": {"status": sync, "revision": "60decb3abcdef"}, "health": {"status": health},
                        "operationState": {"phase": phase, "finishedAt": ts(5), "message": "ok",
@@ -54,6 +59,7 @@ class Fake:
         self.routes: dict[str, object] = {}
         self.prometheus: dict[str, list] = {}   # regex on the query -> result vector
         self.loki_result: list = []
+        self.loki: dict[str, list] = {}         # regex on the LogQL query -> result (else loki_result)
         self.logs: dict[str, str] = {}
         self.identity = "system:serviceaccount:agent-access:harbourbank-observer"
         for env in ("dev", "qa", "prod"):
@@ -80,7 +86,9 @@ class Fake:
             result = next((v for k, v in self.prometheus.items() if re.search(k, query)), [])
             return httpx.Response(200, json={"status": "success", "data": {"resultType": "vector", "result": result}})
         if "/proxy/loki/" in path:
-            return httpx.Response(200, json={"status": "success", "data": {"result": self.loki_result}})
+            query = request.url.params["query"]
+            result = next((v for k, v in self.loki.items() if re.search(k, query)), self.loki_result)
+            return httpx.Response(200, json={"status": "success", "data": {"result": result}})
         if path.endswith("/log"):
             pod_name = path.split("/")[-2]
             return httpx.Response(200, text=self.logs.get(pod_name, ""))
