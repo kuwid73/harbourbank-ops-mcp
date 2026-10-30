@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 import anyio
 import pytest
 
-from conftest import deployment, pod, ts
+from conftest import commit, deployment, pod, ts
 from harbourbank_ops_mcp import ops, server
 from harbourbank_ops_mcp.safety import AuditLog
 
@@ -159,7 +159,7 @@ def test_end_of_day_status_reads_the_published_results(fake, kube):
 
 def test_end_of_day_status_before_any_run(kube):
     result = ops.end_of_day_status(kube, "dev")
-    assert result["books_balance"] is None and "no end-of-day run" in result["note"]
+    assert result["books_balance"] is None and any("no end-of-day run" in n for n in result["notes"])
 
 
 def test_change_audit_keeps_the_newest_push_first_when_lookups_finish_out_of_order(fake, gh):
@@ -176,6 +176,7 @@ def test_change_audit_keeps_the_newest_push_first_when_lookups_finish_out_of_ord
 
     for i in range(5):
         n = 20 - i
+        fake.routes[f"{repo}/commits/a{i}"] = commit(f"change {i}", files=["apps/harbourbank/base/x.yaml"])
         fake.routes[f"{repo}/commits/a{i}/pulls"] = pulls_for(n, 0.2 if i == 0 else 0)
         fake.routes[f"{repo}/pulls/{n}"] = {"title": f"PR {n}", "user": {"login": "kuwid73"},
                                             "merged_by": {"login": "kuwid73"}, "merged_at": ts(i)}

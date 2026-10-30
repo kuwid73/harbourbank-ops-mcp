@@ -23,7 +23,7 @@ MAX_LOG_LINES = 500
 MAX_WINDOW_MINUTES = 24 * 60
 MAX_SERIES = 50
 MAX_POINTS = 120
-AUDIT_WORKERS = 8         # parallel GitHub lookups in change_audit, well under its rate limits
+AUDIT_WORKERS = 8         # parallel GitHub lookups, well under its rate limits
 QUIET_ALERTS = {"Watchdog", "InfoInhibitor"}    # always firing by design
 NAME = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$")   # a Kubernetes object name
 
@@ -67,6 +67,32 @@ def _split_image(image: str) -> dict:
 
 def _items(kube: Kube, path: str, **params: Any) -> list[dict]:
     return kube.get(path, **params).get("items", [])
+
+
+def _touches(paths: list[str]) -> list[str]:
+    """Where a GitOps change lands, from its file paths. base/ renders into every environment."""
+    where = set()
+    for path in paths:
+        parts = path.split("/")
+        if path.startswith("apps/harbourbank/overlays/") and len(parts) > 4:
+            where.add(parts[3])
+        elif path.startswith("apps/harbourbank/base/"):
+            where.update(ENVS)
+        elif path.startswith("platform/"):
+            where.add("platform")
+        elif path.startswith("bootstrap/"):
+            where.add("lab bootstrap (not deployed by ArgoCD)")
+        else:
+            where.add("docs/other (not deployed)")
+    return sorted(where)
+
+
+def _maker(author_name: str, author_email: str, author_type: str | None = None) -> str:
+    """'bot' for CI and GitHub Actions, else 'human'. A push's GitHub actor is the credential's owner
+    (a deploy key pushes as the repo owner), so the commit author is what tells them apart."""
+    if author_type == "Bot" or "[bot]" in author_email or author_name in ("harbourbank-ci", "github-actions[bot]"):
+        return "bot"
+    return "human"
 
 
 # --- Prometheus -------------------------------------------------------------------------
@@ -258,6 +284,27 @@ def find_problems(kube: Kube, env: str | None = None) -> dict:
             "healthy": not any(p["severity"] != "low" for p in problems), "problems": problems[:40]}
 
 
+_PULLED = re.compile(r"Successfully pulled image .*? in ([0-9hms.]+) |(already present on machine)")
+
+
+def _image_pull(kube: Kube, env: str, pod: str) -> dict:
+    """From the pod's kubelet "Pulled" event (kept in Loki for 7 days). "already present on machine"
+    means the node had the image, so no download or cache was involved."""
+    found = search_logs(kube, env, contains=f"name={pod} kind=Pod ", regex="reason=Pulled ", source="events",
+                        since_minutes=7 * MAX_WINDOW_MINUTES, limit=5)
+    for entry in found["lines"]:
+        if m := _PULLED.search(entry["line"]):
+            if m.group(2):
+                return {"source": "already on the node (no download)", "when": entry["time"]}
+            return {"source": "downloaded (through the lab's pull-through cache when it has the image)",
+                    "took": m.group(1), "when": entry["time"]}
+    return {"source": "unknown (no Pulled event in the last 7 days)"}
+
+
+def _pods_with_pulls(kube: Kube, env: str, pods: list[dict]) -> list[dict]:
+    return [_pod(p) | {"image_pull": _image_pull(kube, env, p["metadata"]["name"])} for p in pods[:5]]
+
+
 def describe_workload(kube: Kube, env: str, name: str) -> dict:
     ns, name = _ns(env), _name(name)
     if deploy := kube.get_or_none(f"/apis/apps/v1/namespaces/{ns}/deployments/{name}"):
@@ -269,7 +316,8 @@ def describe_workload(kube: Kube, env: str, name: str) -> dict:
                 | {"desired": deploy["spec"].get("replicas")},
                 "conditions": [{k: c.get(k) for k in ("type", "status", "reason", "message")}
                                for c in deploy.get("status", {}).get("conditions", [])],
-                "pods": [_pod(p) for p in _items(kube, f"/api/v1/namespaces/{ns}/pods", labelSelector=selector)],
+                "pods": _pods_with_pulls(kube, env, _items(kube, f"/api/v1/namespaces/{ns}/pods",
+                                                           labelSelector=selector)),
                 "events": _events(kube, ns, name)}
     if cron := kube.get_or_none(f"/apis/batch/v1/namespaces/{ns}/cronjobs/{name}"):
         jobs = [j for j in _items(kube, f"/apis/batch/v1/namespaces/{ns}/jobs")
@@ -284,7 +332,7 @@ def describe_workload(kube: Kube, env: str, name: str) -> dict:
         pods = _items(kube, f"/api/v1/namespaces/{ns}/pods", labelSelector=f"batch.kubernetes.io/job-name={name}")
         return {"kind": "Job", **_job(job), "pods": [_pod(p) for p in pods], "events": _events(kube, ns, name)}
     if pod := kube.get_or_none(f"/api/v1/namespaces/{ns}/pods/{name}"):
-        return {"kind": "Pod", **_pod(pod),
+        return {"kind": "Pod", **_pod(pod), "image_pull": _image_pull(kube, env, name),
                 "images": [_split_image(c["image"]) for c in pod["spec"]["containers"]],
                 "events": _events(kube, ns, name)}
     names = [d["metadata"]["name"] for d in _items(kube, f"/apis/apps/v1/namespaces/{ns}/deployments")]
@@ -294,12 +342,27 @@ def describe_workload(kube: Kube, env: str, name: str) -> dict:
 
 def _job(job: dict) -> dict:
     status = job.get("status", {})
+    annotations = job["metadata"].get("annotations") or {}
     failed = next((c for c in status.get("conditions", []) if c["type"] == "Failed" and c["status"] == "True"), None)
     state = "failed" if failed else "succeeded" if status.get("succeeded") else "running" if status.get("active") \
         else "pending"
-    return {"name": job["metadata"]["name"], "state": state, "started": status.get("startTime"),
-            "completed": status.get("completionTime"),
-            **({"failure": {"reason": failed.get("reason"), "message": failed.get("message")}} if failed else {})}
+    scheduled = annotations.get("batch.kubernetes.io/cronjob-scheduled-timestamp")
+    trigger = "schedule" if scheduled else "manual" if "cronjob.kubernetes.io/instantiate" in annotations else None
+    summary = {"name": job["metadata"]["name"], "state": state, "trigger": trigger, "started": status.get("startTime"),
+               "completed": status.get("completionTime"),
+               # a Job retries in new pods: a "succeeded" Job may have failed attempts before it
+               "failed_attempts": status.get("failed", 0)}
+    if scheduled:
+        summary["scheduled_for"] = scheduled
+        if status.get("startTime"):
+            late = datetime.fromisoformat(status["startTime"].replace("Z", "+00:00")) - \
+                datetime.fromisoformat(scheduled.replace("Z", "+00:00"))
+            if late > timedelta(minutes=5):
+                minutes = int(late.total_seconds()) // 60
+                summary["started_late_by"] = f"{minutes // 60}h{minutes % 60:02d}m"
+    if failed:
+        summary["failure"] = {"reason": failed.get("reason"), "message": failed.get("message")}
+    return summary
 
 
 def _pods_for(kube: Kube, ns: str, workload: str) -> list[dict]:
@@ -348,15 +411,20 @@ def _logql_string(value: str) -> str:
 
 
 def search_logs(kube: Kube, env: str | None = None, contains: str | None = None, regex: str | None = None,
-                source: Literal["pods", "events"] = "pods", app: str | None = None,
+                source: Literal["pods", "events", "argocd"] = "pods", app: str | None = None,
                 since_minutes: int = 60, limit: int = 100) -> dict:
     """The query is built here, never taken from the model: Loki holds every namespace's logs, and
-    this server may only show Harbour Bank's."""
-    namespace = f'namespace="{_ns(env)}"' if env else f'namespace=~"{"|".join(ENVS.values())}"'
-    parts =[namespace, 'job="kubernetes-events"' if source == "events" else 'job="loki.source.kubernetes.pods"']
-    if app:
-        parts.append(f'app="{_name(app)}"')
-    query = "{" + ", ".join(parts) + "}"
+    this server may only show Harbour Bank's. source='argocd' reads ArgoCD's events about the
+    harbourbank-<env> Applications only (health and sync changes), anchored on the event's object name."""
+    if source == "argocd":
+        apps = f"harbourbank-{env}" if env and _ns(env) else "harbourbank-(dev|qa|prod)"
+        query = '{namespace="argocd", job="kubernetes-events"} |~ ' + _logql_string(f"^name={apps} kind=Application ")
+    else:
+        namespace = f'namespace="{_ns(env)}"' if env else f'namespace=~"{"|".join(ENVS.values())}"'
+        parts = [namespace, 'job="kubernetes-events"' if source == "events" else 'job="loki.source.kubernetes.pods"']
+        if app:
+            parts.append(f'app="{_name(app)}"')
+        query = "{" + ", ".join(parts) + "}"
     if contains:
         query += f" |= {_logql_string(contains)}"
     if regex:
@@ -371,7 +439,8 @@ def search_logs(kube: Kube, env: str | None = None, contains: str | None = None,
         labels = stream["stream"]
         for ts, line in stream["values"]:
             lines.append({"time": datetime.fromtimestamp(int(ts) / 1e9, UTC).isoformat(timespec="seconds"),
-                          "env": next((k for k, v in ENVS.items() if v == labels.get("namespace")), None),
+                          "env": next((k for k, v in ENVS.items() if v == labels.get("namespace")), None)
+                          or next((k for k in ENVS if line.startswith(f"name=harbourbank-{k} ")), None),
                           "pod": labels.get("pod"), "line": line[:1000]})
     lines.sort(key=lambda x: x["time"], reverse=True)
     return {"query": query, "since_minutes": since_minutes, "returned": len(lines[:limit]),
@@ -400,25 +469,42 @@ def query_metrics(kube: Kube, promql: str, range_minutes: int = 0, step_seconds:
 
 # --- change history (GitHub) ------------------------------------------------------------
 
-_PR_NUMBER = re.compile(r"\(#(\d+)\)\s*$")
+_PR_NUMBER = re.compile(r"\(#(\d+)\)\s*$|^Merge pull request #(\d+) ")
 
 
 def _pull_request(gh: GitHub, repo: str, number: int) -> dict:
     pr = gh.get(f"/repos/{repo}/pulls/{number}")
     reviews = gh.get(f"/repos/{repo}/pulls/{number}/reviews")
-    return {"number": number, "title": pr["title"], "author": pr["user"]["login"],
+    author = pr["user"]["login"]
+    approvers = sorted({r["user"]["login"] for r in reviews if r["state"] == "APPROVED"} - {author})
+    return {"number": number, "title": pr["title"], "author": author,
+            "made_by": "bot (CI)" if _maker(author, "", pr["user"].get("type")) == "bot" else "human",
             "merged_by": (pr.get("merged_by") or {}).get("login"), "merged_at": pr.get("merged_at"),
-            "reviews": [f"{r['user']['login']}: {r['state']}" for r in reviews]}
+            "reviews": [f"{r['user']['login']}: {r['state']}" for r in reviews],
+            # GitHub forbids approving your own PR, so an approval here is always someone else's
+            "independent_approval_by": approvers or None}
 
 
 def _commit(gh: GitHub, repo: str, sha: str) -> dict:
     commit = gh.get(f"/repos/{repo}/commits/{sha}")
     title = commit["commit"]["message"].splitlines()[0]
+    author = commit["commit"]["author"]
     entry = {"sha": sha[:7], "title": title, "date": commit["commit"]["committer"]["date"],
-             "author": commit["commit"]["author"]["name"]}
+             "author": author["name"], "made_by": _maker(author["name"], author.get("email", "")),
+             "touches": _touches([f["filename"] for f in commit.get("files", [])])}
     if m := _PR_NUMBER.search(title):
-        entry["pull_request"] = _pull_request(gh, repo, int(m.group(1)))
+        number = int(m.group(1) or m.group(2))
+    else:   # e.g. a branch commit inside a merge-commit PR; a direct push has none
+        pulls = gh.get(f"/repos/{repo}/commits/{sha}/pulls")
+        number = pulls[0]["number"] if pulls else None
+    entry["pull_request"] = _pull_request(gh, repo, number) if number else "none: a direct push"
     return entry
+
+
+def _parallel(fn, items: list) -> list:
+    """GitHub lookups are independent; run them side by side. map() keeps the order."""
+    with ThreadPoolExecutor(max_workers=AUDIT_WORKERS) as pool:
+        return list(pool.map(fn, items))
 
 
 def recent_changes(kube: Kube, gh: GitHub, env: str, days: int = 7) -> dict:
@@ -428,18 +514,35 @@ def recent_changes(kube: Kube, gh: GitHub, env: str, days: int = 7) -> dict:
     since = _now() - timedelta(days=days)
     history = [h for h in app.get("status", {}).get("history", [])
                if datetime.fromisoformat(h["deployedAt"].replace("Z", "+00:00")) >= since]
-    changes = []
-    for h in reversed(history[-20:]):
+    every = app.get("status", {}).get("history", [])
+    previous = {h["revision"]: every[i - 1]["revision"] for i, h in enumerate(every) if i > 0}
+
+    def deployment(h: dict) -> dict:
         entry = {"deployed_at": h["deployedAt"], "git_revision": h["revision"][:7],
                  "started_by": "automated" if (h.get("initiatedBy") or {}).get("automated") else
                  (h.get("initiatedBy") or {}).get("username")}
+        # A deployment ships every commit since the previous one, not just its head commit
+        shas = [h["revision"]]
+        if base := previous.get(h["revision"]):
+            try:
+                compare = gh.get(f"/repos/{REPOS['gitops']}/compare/{base}...{h['revision']}")
+                shas = [c["sha"] for c in compare.get("commits", [])][-10:][::-1] or shas
+            except ApiError:
+                pass
         try:
-            entry["commit"] = _commit(gh, REPOS["gitops"], h["revision"])
+            commits = [_commit(gh, REPOS["gitops"], sha) for sha in shas]
         except ApiError as exc:
-            entry["commit_error"] = str(exc)
-        changes.append(entry)
+            return entry | {"commit_error": str(exc)}
+        entry["commits_newest_first"] = commits
+        entry["changed_this_environment"] = [c["sha"] for c in commits if env in c["touches"]]
+        return entry
+
+    changes = _parallel(deployment, list(reversed(history[-20:])))
     return {"env": env, "days": days, "deployments": changes,
-            "note": "each deployment is a GitOps commit; its pull request shows who approved it"}
+            "how_to_read": f"each deployment ships every GitOps commit since the previous one. "
+                           f"'touches' says where each commit lands: a commit that doesn't list '{env}' "
+                           f"changed nothing in {env}, even though it was part of the deployment. "
+                           f"'made_by' bot = CI pipeline; 'independent_approval_by' = who approved it"}
 
 
 def compare_environments(kube: Kube, gh: GitHub, ahead: str, behind: str) -> dict:
@@ -484,6 +587,19 @@ def end_of_day_status(kube: Kube, env: str) -> dict:
             run_log.append(json.loads(entry["line"]) | {"pod": entry["pod"]})
         except ValueError:
             run_log.append(entry)
+    # Failed attempts leave a Python traceback; its last line ("...Error: ...") says why
+    errors = search_logs(kube, env, regex=r"^[A-Za-z_.]*(Error|Exception): ", app="end-of-day",
+                         since_minutes=7 * MAX_WINDOW_MINUTES, limit=10)
+    failed_attempts = list({e["pod"]: {"time": e["time"], "pod": e["pod"], "error": e["line"].strip()[:300]}
+                            for e in reversed(errors["lines"])}.values())[::-1]   # one per attempt (pod)
+    runs = cron.get("recent_jobs", [])
+    notes = []
+    if not cron.get("last_schedule"):
+        notes.append("the CronJob has not run on its schedule yet; any runs listed were started by hand")
+    if runs and runs[0].get("trigger") == "manual":
+        notes.append("the latest run was started by hand, not by the schedule")
+    if any(r.get("failed_attempts") for r in runs):
+        notes.append("some runs needed retries: see failed_attempts_newest_first for each failed attempt's error")
     yesterday = (_now() - timedelta(days=1)).date().isoformat()
     return {"env": env, "metrics": metrics,
             "books_balance": None if metrics["ledger_imbalance_cents"] is None else
@@ -492,9 +608,21 @@ def end_of_day_status(kube: Kube, env: str) -> dict:
             metrics["last_business_day"] >= yesterday,
             "schedule": {k: cron.get(k) for k in ("schedule", "time_zone", "suspended", "last_schedule",
                                                    "last_success")},
-            "recent_runs": cron.get("recent_jobs", []), "run_results_newest_first": run_log,
-            **({"note": "no end-of-day run has finished yet; metrics appear after the first run"}
-               if metrics["last_business_day"] is None else {})}
+            "next_scheduled_run": _next_daily_run(cron.get("schedule")),
+            "recent_runs": runs, "run_results_newest_first": run_log,
+            "failed_attempts_newest_first": failed_attempts,
+            "notes": notes + (["no end-of-day run has finished yet; metrics appear after the first run"]
+                              if metrics["last_business_day"] is None else [])}
+
+
+def _next_daily_run(schedule: str | None) -> str | None:
+    """Next run of a daily "M H * * *" schedule in UTC (the CronJob's time zone); None for other forms."""
+    m = re.fullmatch(r"(\d+) (\d+) \* \* \*", schedule or "")
+    if not m:
+        return None
+    now = _now()
+    run = now.replace(hour=int(m.group(2)), minute=int(m.group(1)), second=0, microsecond=0)
+    return (run if run > now else run + timedelta(days=1)).isoformat(timespec="minutes")
 
 
 def change_audit(gh: GitHub, repo: Literal["gitops", "app"] = "gitops", days: int = 7) -> dict:
@@ -505,21 +633,35 @@ def change_audit(gh: GitHub, repo: Literal["gitops", "app"] = "gitops", days: in
     suites = gh.get(f"/repos/{full}/rulesets/rule-suites", ref="refs/heads/main", time_period=period)
 
     def push(s: dict) -> dict:
-        entry = {"pushed_at": s.get("pushed_at"), "actor": s.get("actor_name"), "result": s.get("result"),
-                 "evaluation": s.get("evaluation_result"),
+        entry = {"pushed_at": s.get("pushed_at"), "result": s.get("result"),
+                 "github_actor": s.get("actor_name"),
                  "change": f"{(s.get('before_sha') or '')[:7]} -> {(s.get('after_sha') or '')[:7]}"}
+        if s.get("result") == "fail":
+            return entry | {"note": "blocked: this commit never reached main"}
         try:
-            pulls = gh.get(f"/repos/{full}/commits/{s['after_sha']}/pulls")
-            if pulls:
-                entry["pull_request"] = _pull_request(gh, full, pulls[0]["number"])
+            commit = _commit(gh, full, s["after_sha"])
+            entry |= {"made_by": commit["made_by"], "commit_author": commit["author"], "title": commit["title"],
+                      "touches": commit["touches"], "pull_request": commit["pull_request"]}
         except ApiError as exc:
-            entry["pull_request_error"] = str(exc)
+            entry["lookup_error"] = str(exc)
         return entry
 
-    # Three GitHub calls per push, independent of each other: run them side by side (30 s -> a few).
-    # map() keeps the order, so the newest push stays first.
-    with ThreadPoolExecutor(max_workers=AUDIT_WORKERS) as pool:
-        entries = list(pool.map(push, suites[:20]))
-    return {"repo": full, "period": period, "pushes_to_main": entries,
-            "how_to_read": "result 'pass' = the rules were met (e.g. an approved PR); 'bypass' = an admin "
-                           "overrode them and GitHub recorded it; 'fail' = the push was blocked"}
+    entries = _parallel(push, suites[:20])
+    counts = {r: sum(1 for s in suites if s.get("result") == r) for r in ("pass", "bypass", "fail")}
+    return {"repo": full, "period": period, "pushes_total": len(suites), "results": counts,
+            "blocked_pushes": [e for e in entries if e["result"] == "fail"],
+            "rules_in_force_since": _rules_since(gh, full),
+            "pushes_to_main": entries,
+            "how_to_read": "result 'pass' = the rules were met (e.g. an approved PR); 'bypass' = an admin overrode "
+                           "them and GitHub recorded it; 'fail' = the push was blocked (the control working). "
+                           "github_actor is the account that owns the credential used: a CI deploy key pushes "
+                           "as the repo owner, so made_by (from the commit author) says who really made it. "
+                           "Pushes before rules_in_force_since were never subject to the rules"}
+
+
+def _rules_since(gh: GitHub, repo: str) -> dict | None:
+    try:
+        return {r["name"]: gh.get(f"/repos/{repo}/rulesets/{r['id']}").get("created_at")
+                for r in gh.get(f"/repos/{repo}/rulesets")}
+    except ApiError:
+        return None
