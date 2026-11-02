@@ -36,6 +36,9 @@ Every tool is read-only. Start broad (bank_status, find_problems), then narrow d
 Compute figures (ratios, percentages, differences) with a tool, e.g. a PromQL division, not in your
 head, and always state the time window: rates such as the transfer rejection rate change a lot over
 a day. Say which statements are evidence and which are inference.
+Delivery performance (DORA metrics) comes from delivery_metrics: report its figures as given, with
+its window, deployment count and notes; with fewer than 10 deployments they are anecdotes, not a
+baseline. Modelled scenarios are not this server's business: never present a simulation as a measurement.
 Personal data and secrets are masked in all results; say so if a question needs them."""
 
 READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True,
@@ -145,6 +148,18 @@ def build(kube: Kube, gh: GitHub, audit: AuditLog) -> MCPServer:
         commit) and where it lands; the pull request's reviews; and when the rules came into force.
         This is the change-approval audit trail. repo='gitops' covers deployments; 'app' covers code."""
         return ops.change_audit(gh, repo, days)
+
+    @tool(annotations=READ_ONLY)
+    @g
+    def delivery_metrics(env: Literal["dev", "qa", "prod"] = "prod", days: int = 30,
+                         include_platform: bool = True) -> dict:
+        """The four DORA delivery metrics for an environment, measured from Git: deployment frequency,
+        lead time for changes (commit to deployment), change failure rate and time to restore service,
+        each with its reference level (elite/high/medium/low) and the evidence: every deployment (kind,
+        version, changes shipped, lead time, incident caused) and every incident record. Also lists
+        ArgoCD Degraded events that no incident record covers. include_platform counts platform and
+        lab-bootstrap changes as deployments too. Up to 90 days."""
+        return ops.delivery_metrics(kube, gh, env, days, include_platform)
 
     return server
 

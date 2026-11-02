@@ -26,6 +26,7 @@ It fetches facts. It does no reasoning of its own (there's no LLM inside) and it
 | `compare_environments` | what's in one environment's build that another doesn't have yet |
 | `end_of_day_status` | the nightly batch: business day closed, interest paid, whether the books balance, the next run, recent runs (scheduled or manual, how late, retries), and every failed attempt's error |
 | `change_audit` | GitHub's record of every push to `main`: rules passed, bypassed or blocked; who really made each change (a CI deploy key pushes as the repo owner); the PR's reviews; when the rules came into force |
+| `delivery_metrics` | the four DORA metrics for an environment, measured from Git: deployment frequency, lead time for changes, change failure rate, time to restore, each with its reference level and evidence (every deployment and incident record); also ArgoCD Degraded events no incident record covers |
 
 ## Safety model
 
@@ -33,7 +34,7 @@ It fetches facts. It does no reasoning of its own (there's no LLM inside) and it
 |---|---|
 | **Read-only identity** | It runs as the Kubernetes ServiceAccount `harbourbank-observer` ([its permissions](https://github.com/kuwid73/harbourbank-gitops/blob/main/platform/manifests/agent-access/harbourbank-observer.yaml), managed in Git). There are no write verbs and no Secrets or ConfigMaps, and Prometheus and Loki are reachable by HTTP GET only. |
 | **Refuses any other identity** | At start-up the server asks the API "who am I?" and exits unless the answer is `harbourbank-observer`, so it can't run with admin credentials by mistake. |
-| **Read-only code** | Every tool issues only GET requests; a test runs all ten against a fake cluster and fails on anything else. The tools also declare `readOnlyHint` to the client. |
+| **Read-only code** | Every tool issues only GET requests; a test runs all eleven against a fake cluster and fails on anything else. The tools also declare `readOnlyHint` to the client. |
 | **Fixed scope** | Only `harbourbank-dev/qa/prod` and the two Harbour Bank repos. Object names are validated, and log searches are built by the server, not passed through from the model. |
 | **Personal data and secrets masked** | Emails (`a***@domain`), account numbers (`HB******1234`), tokens and database passwords are masked in every result and in the audit log. |
 | **Bounded output** | Time windows, line and series caps, and a hard limit of 40,000 characters per result. |
@@ -70,6 +71,40 @@ Add this to `claude_desktop_config.json` (Settings → Developer → Edit Config
   }
 }
 ```
+
+## Delivery metrics (DORA)
+
+The four [DORA](https://dora.dev) metrics, computed one way from three sources:
+
+| Source | How | Use |
+|---|---|---|
+| **The live lab** | the `delivery_metrics` tool: deployments from the gitops repo's history, lead times from the PRs' and app's commits, failures from the incident records in [`harbourbank-gitops/incidents/`](https://github.com/kuwid73/harbourbank-gitops/tree/main/incidents) | "How are we delivering?" in Claude Desktop |
+| **CSV files** | `hb-delivery report <dir>` | measure a real baseline from exports of a CI tool and an incident tool, **on a workstation**: no data leaves it and no AI is involved |
+| **Modelled scenarios** | `hb-delivery simulate` / `compare` with a [scenario file](scenarios/) | compare ways of working before measuring them. Results are labelled **ILLUSTRATIVE** |
+
+```bash
+uv run hb-delivery compare scenarios/*.yaml                   # three ways of working, 200 modelled quarters each
+uv run hb-delivery simulate scenarios/1-manual-release-train.yaml --out /tmp/sim   # one quarter, as CSV
+uv run hb-delivery report /tmp/sim --env prod                 # the same report a real export would get
+```
+
+**CSV format** (times in ISO 8601 with a UTC offset):
+- `deployments.csv`: `deployment_id, env, deployed_at, kind, title, change_made_at`, one row per change shipped
+- `incidents.csv`: `incident_id, env, started, detected, restored, caused_by_deployment, title`
+- `effort.csv` (optional): `activity, hours`
+
+**Definitions.**
+- *Lead time* runs from each change's first commit to the deployment that shipped it.
+- A *failed deployment* is one an incident names as its cause.
+- *Time to restore* runs from when service was first affected to when it was restored.
+- Reports warn when there are fewer than 10 deployments or the window is under 28 days. The
+  reference levels are approximately those of the State of DevOps reports and are printed with
+  every result.
+
+**The scenarios are assumptions, not findings.** They model one organisation three ways: a manual
+release train, an automated pipeline, and the pipeline plus a read-only agent. The change volume and
+the chance that a change is faulty stay the same in all three, so the differences come from the
+process alone. Replace every number with a measured one before quoting a result.
 
 ## Demo: masking
 

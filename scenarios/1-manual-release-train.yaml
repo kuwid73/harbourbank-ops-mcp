@@ -1,0 +1,38 @@
+# ILLUSTRATIVE. Every number below is an assumption, typical of a regulated organisation that
+# releases in scheduled windows after a change-board approval. Replace each one with a measured
+# value (from the CI tool, the change and incident records, and timesheets) before quoting results.
+name: Manual release train
+description: >
+  Weekly release window after change-board approval, manual testing in a shared test environment,
+  incidents found by users or operators and diagnosed by hand.
+changes_per_week: 20
+
+# Durations in hours, as {median, p90}: half take less than the median, 90% less than p90
+review_hours: {median: 24, p90: 120}     # from the commit to an approved, merged change
+test_hours: {median: 72, p90: 240}       # manual test cycle, waiting for the test environment
+release:
+  mode: window
+  weekdays: [3]                          # Thursday (Monday = 0)
+  hour_utc: 18
+  approval_cutoff_hours: 72              # the change must be approved by Monday's change board
+
+failure_probability_per_change: 0.02     # chance that one change breaks production
+incident:
+  detect_hours: {median: 1.5, p90: 8}    # a user or an operator notices
+  diagnose_hours: {median: 3, p90: 12}   # bridge call; log access goes through the operations team
+  rollback_share: 0.3                    # big releases are hard to roll back
+  rollback_hours: {median: 3, p90: 8}
+  fix_forward_hours: {median: 24, p90: 72}   # an emergency change
+
+effort_hours:                            # engineer-hours, by activity
+  per_change:
+    code review: 1
+    manual testing: 4
+    change records and audit evidence: 1.5
+  per_release:
+    release planning and change board: 12
+    deployment and verification: 16
+  per_incident:
+    post-incident review: 8
+  per_incident_hour:
+    incident response: 4                 # people on the bridge while service is affected

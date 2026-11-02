@@ -3,6 +3,7 @@
 Scope is fixed here, not left to the model: Harbour Bank's three namespaces, ArgoCD's apps for
 them, and the two Harbour Bank repositories. Every list is capped and every window bounded.
 """
+import base64
 import json
 import re
 import time
@@ -10,6 +11,9 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
+import yaml
+
+from . import delivery
 from .clients import ApiError, GitHub, Kube
 
 Env = Literal["dev", "qa", "prod"]
@@ -18,6 +22,7 @@ REPOS = {"gitops": "kuwid73/harbourbank-gitops", "app": "kuwid73/harbourbank-app
 PROMETHEUS = ("monitoring", "kube-prometheus-stack-prometheus:9090")
 LOKI = ("monitoring", "loki:3100")
 API = "accounts-api"
+IMAGE = "ghcr.io/kuwid73/harbourbank-accounts-api"
 
 MAX_LOG_LINES = 500
 MAX_WINDOW_MINUTES = 24 * 60
@@ -82,6 +87,8 @@ def _touches(paths: list[str]) -> list[str]:
             where.add("platform")
         elif path.startswith("bootstrap/"):
             where.add("lab bootstrap (not deployed by ArgoCD)")
+        elif path.startswith("incidents/"):
+            where.add("incident records (not deployed)")
         else:
             where.add("docs/other (not deployed)")
     return sorted(where)
@@ -665,3 +672,182 @@ def _rules_since(gh: GitHub, repo: str) -> dict | None:
                 for r in gh.get(f"/repos/{repo}/rulesets")}
     except ApiError:
         return None
+
+
+# --- delivery metrics (DORA), from Git ------------------------------------------------------------
+# Prometheus and Loki keep 3 days, ArgoCD the last 10 syncs; Git keeps everything. So deployments
+# come from the gitops repo's history and incidents from the records in its incidents/ folder.
+
+_APP_VERSION = re.compile(r"^sha-[0-9a-f]{7,40}$")
+PLATFORM = {"platform", "lab bootstrap (not deployed by ArgoCD)"}
+
+
+def _time(value: str) -> datetime:
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+
+def _landed(gh: GitHub, sha: str) -> dict:
+    """One commit on main, and the pull request that brought it, if any."""
+    c = gh.get(f"/repos/{REPOS['gitops']}/commits/{sha}")
+    title = c["commit"]["message"].splitlines()[0]
+    author = c["commit"]["author"]
+    if m := _PR_NUMBER.search(title):
+        number = int(m.group(1) or m.group(2))
+    else:
+        number = next((p["number"] for p in gh.get(f"/repos/{REPOS['gitops']}/commits/{sha}/pulls")
+                       if p.get("merged_at")), None)
+    return {"sha": sha, "title": title, "landed": _time(c["commit"]["committer"]["date"]),
+            "made": _time(author["date"]), "made_by": _maker(author["name"], author.get("email", "")),
+            "files": [f["filename"] for f in c.get("files", [])], "parent": (c.get("parents") or [{}])[0].get("sha"),
+            "pr": number}
+
+
+def _overlay_version(gh: GitHub, env: str, ref: str | None) -> str | None:
+    if not ref:
+        return None
+    body = gh.get_or_none(f"/repos/{REPOS['gitops']}/contents/apps/harbourbank/overlays/{env}/kustomization.yaml",
+                          ref=ref)
+    if not body:
+        return None
+    config = yaml.safe_load(base64.b64decode(body["content"])) or {}
+    tag = next((i.get("newTag") for i in config.get("images") or [] if i.get("name") == IMAGE), None)
+    return tag if tag and _APP_VERSION.match(tag) else None
+
+
+def _app_changes(gh: GitHub, old: str | None, new: str) -> list[datetime]:
+    """When each app change in a version bump was first committed. A squash merge is stamped with
+    the merge time, so a commit that came from a PR is dated by the PR's own commits."""
+    app = REPOS["app"]
+    new_sha = new.removeprefix("sha-")
+    if old:
+        commits = gh.get(f"/repos/{app}/compare/{old.removeprefix('sha-')}...{new_sha}").get("commits", [])[-30:]
+    else:   # the first version in this environment: count its head commit only
+        commits = [gh.get(f"/repos/{app}/commits/{new_sha}")]
+    made = []
+    for c in commits:
+        title = c["commit"]["message"].splitlines()[0]
+        if m := _PR_NUMBER.search(title):
+            made += [_time(pc["commit"]["author"]["date"])
+                     for pc in gh.get(f"/repos/{app}/pulls/{int(m.group(1) or m.group(2))}/commits")]
+        else:
+            made.append(_time(c["commit"]["author"]["date"]))
+    return made
+
+
+def _incident_records(gh: GitHub) -> list[dict]:
+    listing = gh.get_or_none(f"/repos/{REPOS['gitops']}/contents/incidents", ref="main") or []
+    records = []
+    for item in listing:
+        if item.get("type") == "file" and item["name"].endswith((".yaml", ".yml")):
+            body = gh.get(f"/repos/{REPOS['gitops']}/contents/{item['path']}", ref="main")
+            record = yaml.safe_load(base64.b64decode(body["content"])) or {}
+            # YAML reads an unquoted timestamp as a datetime; keep every value JSON-ready
+            records.append({k: v.isoformat() if isinstance(v, datetime) else v for k, v in record.items()}
+                           | {"file": item["path"]})
+    return records
+
+
+def delivery_metrics(kube: Kube, gh: GitHub, env: str = "prod", days: int = 30,
+                     include_platform: bool = True) -> dict:
+    """DORA's four metrics for one environment, measured from Git, with the evidence for each."""
+    _ns(env)
+    days = max(1, min(days, 90))
+    end = _now()
+    start = end - timedelta(days=days)
+    listed = gh.get(f"/repos/{REPOS['gitops']}/commits", sha="main",
+                    since=start.isoformat(timespec="seconds"), per_page=100)
+    commits = _parallel(lambda c: _landed(gh, c["sha"]), listed)
+
+    # A pull request lands as one deployment, however many commits it has; a direct push is its own
+    groups: dict[str, list[dict]] = {}
+    for c in commits:
+        groups.setdefault(f"gitops#{c['pr']}" if c["pr"] else f"gitops@{c['sha'][:7]}", []).append(c)
+    argocd = {h["revision"]: h["deployedAt"] for h in kube.get(
+        f"/apis/argoproj.io/v1alpha1/namespaces/argocd/applications/harbourbank-{env}").get("status", {})
+        .get("history", [])}
+
+    def deployment(item: tuple[str, list[dict]]) -> dict | None:
+        key, group = item
+        touches = set(_touches([f for c in group for f in c["files"]]))
+        if env not in touches and not (include_platform and touches & PLATFORM):
+            return None
+        head = max(group, key=lambda c: c["landed"])
+        number = group[0]["pr"]
+        if number:   # a PR's own commits, dated when they were written
+            made = [(_time(pc["commit"]["author"]["date"]), _maker(pc["commit"]["author"]["name"],
+                                                                    pc["commit"]["author"].get("email", "")))
+                    for pc in gh.get(f"/repos/{REPOS['gitops']}/pulls/{number}/commits")]
+        else:
+            made = [(c["made"], c["made_by"]) for c in group]
+        changes = [t for t, by in made if by == "human"]   # a pipeline's commit is a step, not a change
+        kind = "config" if env in touches else "platform" if "platform" in touches else "lab tooling"
+        version = None
+        if f"apps/harbourbank/overlays/{env}/kustomization.yaml" in {f for c in group for f in c["files"]}:
+            old, new = _overlay_version(gh, env, head["parent"]), _overlay_version(gh, env, head["sha"])
+            if new and new != old:
+                kind, version = "app version", {"from": old, "to": new}
+                changes += _app_changes(gh, old, new)
+        synced = argocd.get(head["sha"])
+        return {"id": key, "title": head["title"], "kind": kind, "version": version,
+                "deployed_at": _time(synced) if synced else head["landed"],
+                "deployed_at_from": "ArgoCD sync" if synced else
+                "merge to main (ArgoCD syncs within about 3 minutes" +
+                ("; a lab bootstrap change takes effect at the next lab start)" if kind == "platform" else ")"),
+                "changes": changes}
+
+    found = [d for d in _parallel(deployment, list(groups.items())) if d]
+    # An environment created inside the window: measure from its first deployment, not before it existed
+    notes = []
+    if not gh.get(f"/repos/{REPOS['gitops']}/commits", sha="main", path=f"apps/harbourbank/overlays/{env}",
+                  until=start.isoformat(timespec="seconds"), per_page=1):
+        own = [d["deployed_at"] for d in found if d["kind"] in ("config", "app version")]
+        if own:
+            start = min(own)
+            found = [d for d in found if d["deployed_at"] >= start]
+            notes.append(f"{env} was first deployed at {start.isoformat(timespec='minutes')}: the window starts "
+                         f"there, not {days} days ago")
+    deployments = [delivery.Deployment(id=d["id"], env=env, deployed_at=d["deployed_at"], changes=tuple(d["changes"]),
+                                       kind=d["kind"], title=d["title"]) for d in found]
+
+    records, incidents = _incident_records(gh), []
+    for r in records:
+        if env in (r.get("environments") or []):
+            incidents.append(delivery.Incident(
+                id=r["id"], env=env, started=_time(r["started"]), detected=_time(r.get("detected") or r["started"]),
+                restored=_time(r["restored"]) if r.get("restored") else None, caused_by=r.get("caused_by"),
+                title=r.get("title", "")))
+    result = delivery.metrics(deployments, incidents, env, start, end)
+    result["notes"] = notes + result["notes"]
+
+    # ArgoCD's Degraded events with no incident record covering them (Loki keeps 3 days)
+    degraded = search_logs(kube, env, regex="-> Degraded", source="argocd",
+                           since_minutes=min(days, 7) * MAX_WINDOW_MINUTES, limit=50)["lines"]
+    spans = [(i.started - timedelta(minutes=10), (i.restored or end) + timedelta(minutes=10)) for i in incidents]
+    unrecorded = [{"time": e["time"], "event": e["line"][:300]} for e in degraded
+                  if not any(a <= _time(e["time"]) <= b for a, b in spans)]
+
+    failed_by = {i.caused_by: i.id for i in incidents}
+    return result | {
+        "deployments_newest_first": [
+            {"id": d["id"], "title": d["title"], "kind": d["kind"], "version": d["version"],
+             "deployed_at": d["deployed_at"].isoformat(timespec="seconds"), "deployed_at_from": d["deployed_at_from"],
+             "changes": len(d["changes"]),
+             "lead_time_hours": max((round((d["deployed_at"] - t).total_seconds() / 3600, 2) for t in d["changes"]),
+                                    default=None),
+             "caused_incident": failed_by.get(d["id"])}
+            for d in sorted(found, key=lambda d: d["deployed_at"], reverse=True)][:40],
+        "incidents": [{k: r.get(k) for k in ("id", "title", "environments", "started", "detected", "restored",
+                                             "detected_by", "caused_by", "remediation", "file")} for r in records],
+        "possible_unrecorded_failures": unrecorded,
+        "sources": {"deployments": f"{REPOS['gitops']} main, {len(listed)} commits since {start.date()}"
+                                   + (" (capped at 100: the window may be incomplete)" if len(listed) >= 100 else ""),
+                    "incidents": f"{REPOS['gitops']}/incidents/*.yaml ({len(records)} records)",
+                    "unrecorded check": "ArgoCD Degraded events in Loki (kept 3 days)"},
+        "how_to_read": "a deployment is a pull request (or direct push) merged to main that lands in this "
+                       "environment; with include_platform, platform changes (deployed by ArgoCD) and lab tooling "
+                       "changes (bootstrap scripts, run by hand) count too, since the environment runs on them. "
+                       "'changes' are the human commits it shipped (for an app "
+                       "version, the app commits since the previous version); lead_time_hours is the oldest one's "
+                       "wait. A failed deployment is one an incident record names in caused_by. "
+                       "possible_unrecorded_failures lists ArgoCD Degraded events no incident record covers: "
+                       "either record them, or they needed no remediation (DORA counts only those that did)"}
