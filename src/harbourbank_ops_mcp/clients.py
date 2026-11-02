@@ -89,7 +89,15 @@ class GitHub:
         self.authenticated = bool(token)
         self._http = httpx.Client(base_url=self.API, headers=headers, timeout=TIMEOUT_SECONDS, transport=transport)
 
-    def get(self, path: str, **params: Any) -> Any:
+    def get(self, path: str, /, **params: Any) -> Any:   # positional-only: GitHub has a `path` parameter
         response = self._http.get(path, params={k: v for k, v in params.items() if v is not None})
         _raise_for(response)
         return response.json()
+
+    def get_or_none(self, path: str, /, **params: Any) -> Any:
+        try:
+            return self.get(path, **params)
+        except ApiError as exc:
+            if exc.status == 404:
+                return None
+            raise

@@ -1,0 +1,36 @@
+# ILLUSTRATIVE. The same organisation and the same code quality as 1-manual-release-train.yaml
+# (same change volume, same chance that a change is faulty), with the delivery process the Harbour
+# Bank lab uses: CI with automated tests and a vulnerability gate, GitOps, and promotion pull
+# requests approved by a code owner. No AI agent.
+name: Automated pipeline
+description: >
+  Each change released on its own through CI and GitOps; promotion pull requests are the change
+  approval and the audit record; alerts detect failures; engineers diagnose by hand; rollback is a
+  revert pull request.
+changes_per_week: 20
+
+review_hours: {median: 6, p90: 24}
+test_hours: {median: 1, p90: 3}          # automated tests and image scan in CI
+release:
+  mode: on_demand
+  deploy_hours: {median: 4, p90: 24}     # waiting for the qa and prod promotion approvals
+
+failure_probability_per_change: 0.02
+incident:
+  detect_hours: {median: 0.25, p90: 1}   # an alert fires
+  diagnose_hours: {median: 1.5, p90: 6}  # an engineer reads logs, metrics, events and Git history
+  rollback_share: 0.9                    # one small change: revert it
+  rollback_hours: {median: 0.33, p90: 1}
+  fix_forward_hours: {median: 4, p90: 24}
+
+effort_hours:
+  per_change:
+    code review: 1
+    manual testing: 0.5                  # exploratory checks only
+    change records and audit evidence: 0.5   # the PR is the record; someone still compiles evidence
+  per_release:
+    deployment and verification: 0.5     # approve the promotion, check the smoke test
+  per_incident:
+    post-incident review: 6
+  per_incident_hour:
+    incident response: 3

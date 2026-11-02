@@ -1,0 +1,35 @@
+# ILLUSTRATIVE. 2-automated-pipeline.yaml plus a read-only operations agent (the Harbour Bank ops
+# MCP server): it gathers the evidence, people decide and approve. Only what an agent can plausibly
+# change differs from the automated pipeline: diagnosis time, and the hours spent gathering
+# evidence. Detection, the failure rate and code review are unchanged.
+name: Agent-assisted pipeline
+description: >
+  The automated pipeline, plus an agent that rebuilds incident timelines, answers "what changed and
+  who approved it", runs release checks and drafts the audit evidence and post-incident timeline.
+changes_per_week: 20
+
+review_hours: {median: 6, p90: 24}
+test_hours: {median: 1, p90: 3}
+release:
+  mode: on_demand
+  deploy_hours: {median: 4, p90: 24}
+
+failure_probability_per_change: 0.02
+incident:
+  detect_hours: {median: 0.25, p90: 1}
+  diagnose_hours: {median: 0.33, p90: 1.5}   # the agent's evidence; an engineer confirms it
+  rollback_share: 0.9
+  rollback_hours: {median: 0.33, p90: 1}
+  fix_forward_hours: {median: 4, p90: 24}
+
+effort_hours:
+  per_change:
+    code review: 1
+    manual testing: 0.5
+    change records and audit evidence: 0.1   # the agent compiles it; a person checks it
+  per_release:
+    deployment and verification: 0.25
+  per_incident:
+    post-incident review: 2              # the agent drafts the timeline
+  per_incident_hour:
+    incident response: 2

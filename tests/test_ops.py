@@ -17,7 +17,7 @@ def call_every_tool(kube, gh, tmp_path):
         "get_logs": {"env": "prod", "workload": "accounts-api"}, "search_logs": {"contains": "error"},
         "query_metrics": {"promql": "up"}, "recent_changes": {"env": "prod"},
         "compare_environments": {"ahead": "qa", "behind": "prod"}, "end_of_day_status": {"env": "prod"},
-        "change_audit": {},
+        "change_audit": {}, "delivery_metrics": {},
     }
 
     async def run():
@@ -45,7 +45,7 @@ def test_every_tool_only_ever_reads(fake, kube, gh, tmp_path):
 def test_every_tool_call_is_audited(fake, kube, gh, tmp_path):
     call_every_tool(kube, gh, tmp_path)
     lines = (tmp_path / "audit.jsonl").read_text().splitlines()
-    assert len(lines) == 10
+    assert len(lines) == 11
 
 
 # --- scope ------------------------------------------------------------------------------
