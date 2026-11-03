@@ -124,20 +124,28 @@ def metrics(deployments: list[Deployment], incidents: list[Incident], env: str, 
     if any(i.restored is None for i in incs):
         notes.append("some incidents are still open; they have no restore time yet")
 
+    # Too little history for a baseline: every level says so, so no answer can quote one bare
+    baseline = len(deps) >= MIN_DEPLOYMENTS and (end - start) >= timedelta(days=MIN_DAYS)
+
+    def rated(metric: str, value: float | None) -> str | None:
+        found = level(metric, value)
+        return found if baseline or found is None else f"{found} (indicative)"
+
     result = {
+        **({} if baseline else {"read_first": "not a baseline yet: " + "; ".join(notes[:2])}),
         "env": env,
         "window": {"from": start.isoformat(timespec="minutes"), "to": end.isoformat(timespec="minutes"),
                    "days": round((end - start).total_seconds() / 86400, 1)},
         "deployment_frequency": {"deployments": len(deps), "per_week": frequency,
                                  "by_kind": dict(sorted(_count(d.kind for d in deps).items())),
-                                 "level": level("deployment_frequency_per_week", frequency)},
+                                 "level": rated("deployment_frequency_per_week", frequency)},
         "lead_time_for_changes_hours": (lead_spread or {}) | {
-            "level": level("lead_time_hours", lead_spread and lead_spread["median"]),
+            "level": rated("lead_time_hours", lead_spread and lead_spread["median"]),
             "measured": "from each change's commit to the deployment that shipped it"},
         "change_failure_rate": {"failed_deployments": len(failed), "deployments": len(deps), "rate": failure_rate,
-                                "level": level("change_failure_rate", failure_rate), "failed": failed},
+                                "level": rated("change_failure_rate", failure_rate), "failed": failed},
         "time_to_restore_hours": (restore_spread or {}) | {
-            "level": level("restore_hours", restore_spread and restore_spread["median"]),
+            "level": rated("restore_hours", restore_spread and restore_spread["median"]),
             "time_to_detect": _spread(detect),
             "measured": "from when service was first affected to when it was restored, for incidents "
                         "caused by a deployment"},
