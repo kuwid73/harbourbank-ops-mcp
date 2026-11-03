@@ -31,13 +31,20 @@ def test_the_four_metrics_with_their_evidence():
 
     assert m["deployment_frequency"]["deployments"] == 2 and m["deployment_frequency"]["per_week"] == 2
     assert m["lead_time_for_changes_hours"]["median"] == 12 and m["lead_time_for_changes_hours"]["count"] == 3
-    assert m["change_failure_rate"] == {"failed_deployments": 1, "deployments": 2, "rate": 0.5, "level": "low",
-                                        "failed": ["d2"]}
-    assert m["time_to_restore_hours"]["median"] == 1 and m["time_to_restore_hours"]["level"] == "elite"
+    assert m["change_failure_rate"] == {"failed_deployments": 1, "deployments": 2, "rate": 0.5,
+                                        "level": "low (indicative)", "failed": ["d2"]}
+    assert m["time_to_restore_hours"]["median"] == 1 and m["time_to_restore_hours"]["level"] == "elite (indicative)"
     assert m["time_to_restore_hours"]["time_to_detect"]["median"] == 0.25
     assert [i["id"] for i in m["other_incidents"]] == ["i2"]
     assert any("only 2 deployments" in n for n in m["notes"])   # too few to call it a baseline
     assert any("only 7.0 days" in n for n in m["notes"])
+    assert next(iter(m)) == "read_first" and m["read_first"].startswith("not a baseline yet")
+
+
+def test_a_baseline_quotes_its_levels_plainly():
+    deployments = [Deployment(f"d{n}", "prod", at(24 * 3 * n + 1), (at(24 * 3 * n),)) for n in range(12)]
+    m = delivery.metrics(deployments, [], "prod", T0, at(24 * 35))
+    assert "read_first" not in m and m["lead_time_for_changes_hours"]["level"] == "elite"
 
 
 def test_reference_levels():
