@@ -528,25 +528,41 @@ def recent_changes(kube: Kube, gh: GitHub, env: str, days: int = 7) -> dict:
         entry = {"deployed_at": h["deployedAt"], "git_revision": h["revision"][:7],
                  "started_by": "automated" if (h.get("initiatedBy") or {}).get("automated") else
                  (h.get("initiatedBy") or {}).get("username")}
+        return entry | shipped(h["revision"], previous.get(h["revision"]))
+
+    def shipped(revision: str, base: str | None) -> dict:
         # A deployment ships every commit since the previous one, not just its head commit
-        shas = [h["revision"]]
-        if base := previous.get(h["revision"]):
+        shas = [revision]
+        if base:
             try:
-                compare = gh.get(f"/repos/{REPOS['gitops']}/compare/{base}...{h['revision']}")
+                compare = gh.get(f"/repos/{REPOS['gitops']}/compare/{base}...{revision}")
                 shas = [c["sha"] for c in compare.get("commits", [])][-10:][::-1] or shas
             except ApiError:
                 pass
         try:
             commits = [_commit(gh, REPOS["gitops"], sha) for sha in shas]
         except ApiError as exc:
-            return entry | {"commit_error": str(exc)}
-        entry["commits_newest_first"] = commits
-        entry["changed_this_environment"] = [c["sha"] for c in commits if env in c["touches"]]
-        return entry
+            return {"commit_error": str(exc)}
+        return {"commits_newest_first": commits,
+                "changed_this_environment": [c["sha"] for c in commits if env in c["touches"]]}
 
     changes = _parallel(deployment, list(reversed(history[-20:])))
+    # ArgoCD adds a sync to its history only once it succeeds. One still running, or failed, exists
+    # only as the current operation: show it first, or a stuck rollout looks like no change at all.
+    op = app.get("status", {}).get("operationState") or {}
+    revision = (op.get("syncResult") or {}).get("revision") or (((op.get("operation") or {}).get("sync") or {})
+                                                                .get("revision"))
+    if revision and revision not in {h["revision"] for h in every}:
+        changes.insert(0, {
+            "deployed_at": None, "status": f"not deployed: sync {op.get('phase', 'unknown').lower()}",
+            "git_revision": revision[:7], "sync_started_at": op.get("startedAt"),
+            "sync_finished_at": op.get("finishedAt"), "argocd_message": op.get("message"),
+            "health": (app.get("status", {}).get("health") or {}).get("status"),
+        } | shipped(revision, every[-1]["revision"] if every else None))
     return {"env": env, "days": days, "deployments": changes,
-            "how_to_read": f"each deployment ships every GitOps commit since the previous one. "
+            "how_to_read": f"each deployment ships every GitOps commit since the previous one. An entry with "
+                           f"deployed_at null and a 'status' is a sync that hasn't finished or failed: it is "
+                           f"not running in {env}, though its commits are on main. "
                            f"'touches' says where each commit lands: a commit that doesn't list '{env}' "
                            f"changed nothing in {env}, even though it was part of the deployment. "
                            f"'made_by' bot = CI pipeline; 'independent_approval_by' = who approved it"}
