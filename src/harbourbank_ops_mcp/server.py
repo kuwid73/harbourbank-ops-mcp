@@ -123,7 +123,8 @@ def build(kube: Kube, gh: GitHub, audit: AuditLog) -> MCPServer:
         """Deployments to an environment, newest first: when ArgoCD deployed, every GitOps commit each
         deployment shipped, where each commit lands ('touches': which environments, or platform/docs),
         who made it (human or CI bot), and its pull request (who merged it, reviews, independent
-        approval). Answers "what changed and who approved it". Up to 30 days."""
+        approval). A sync still running or failed comes first with deployed_at null and its status:
+        its commits are on main but not running. Answers "what changed and who approved it". Up to 30 days."""
         return ops.recent_changes(kube, gh, env, days)
 
     @tool(annotations=READ_ONLY)

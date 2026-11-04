@@ -1,6 +1,9 @@
+
 """Facts the tools must report so the model has nothing to guess. Each test is a case from the
 2026-10-30 demo run where a missing fact led to a wrong or incomplete answer (NOTES.md)."""
 import time
+
+import pytest
 
 from conftest import commit, pod, ts
 from harbourbank_ops_mcp import ops
@@ -112,6 +115,44 @@ def test_a_deployment_lists_every_commit_and_whether_it_changed_this_environment
     assert newest["changed_this_environment"] == ["b158424"]          # the dev-only push changed nothing in prod
     assert newest["commits_newest_first"][0]["pull_request"]["number"] == 2   # found from a merge commit title
     assert newest["commits_newest_first"][1]["made_by"] == "bot"
+
+
+@pytest.mark.parametrize("phase, status", [("Failed", "not deployed: sync failed"),
+                                            ("Running", "not deployed: sync running")])
+def test_a_sync_that_hasnt_finished_is_listed_first(fake, kube, gh, phase, status):
+    # Drill 3: ArgoCD records a sync in its history only once it succeeds, so a stuck rollout
+    # looked like no change at all
+    fake.routes["/apis/argoproj.io/v1alpha1/namespaces/argocd/applications/harbourbank-dev"] = {"status": {
+        "health": {"status": "Degraded"},
+        "history": [{"deployedAt": ts(300), "revision": "fcb43ac"}],
+        "operationState": {"phase": phase, "startedAt": ts(30), "finishedAt": ts(10) if phase == "Failed" else None,
+                           "message": "one or more synchronization tasks completed unsuccessfully (retried 5 times).",
+                           "operation": {"sync": {"revision": "bb25f82"}}, "syncResult": {"revision": "bb25f82"}}}}
+    fake.routes[f"{GITOPS}/compare/fcb43ac...bb25f82"] = {"commits": [{"sha": "bb25f82"}]}
+    fake.routes[f"{GITOPS}/commits/bb25f82"] = commit("dev: right-size accounts-api to free node capacity (#25)",
+                                                      files=["apps/harbourbank/overlays/dev/kustomization.yaml"])
+    fake.routes[f"{GITOPS}/pulls/25"] = {"title": "dev: right-size", "user": {"login": "harbourbank-builder[bot]"},
+                                         "merged_by": {"login": "kuwid73"}, "merged_at": ts(31)}
+    fake.routes[f"{GITOPS}/pulls/25/reviews"] = [{"user": {"login": "kuwid73"}, "state": "APPROVED"}]
+    fake.routes[f"{GITOPS}/commits/fcb43ac"] = commit("Revert (#24)", files=["README.md"])
+    fake.routes[f"{GITOPS}/pulls/24"] = {"title": "x", "user": {"login": "kuwid73"}, "merged_at": ts()}
+    fake.routes[f"{GITOPS}/pulls/24/reviews"] = []
+
+    first = ops.recent_changes(kube, gh, "dev")["deployments"][0]
+
+    assert first["deployed_at"] is None and first["status"] == status and first["health"] == "Degraded"
+    assert first["git_revision"] == "bb25f82" and "retried 5 times" in first["argocd_message"]
+    assert first["changed_this_environment"] == ["bb25f82"]
+
+
+def test_a_finished_sync_adds_no_extra_entry(fake, kube, gh):
+    fake.routes["/apis/argoproj.io/v1alpha1/namespaces/argocd/applications/harbourbank-dev"] = {"status": {
+        "history": [{"deployedAt": ts(10), "revision": "fcb43ac"}],
+        "operationState": {"phase": "Succeeded", "syncResult": {"revision": "fcb43ac"}}}}
+    fake.routes[f"{GITOPS}/commits/fcb43ac"] = commit("Readme", files=["README.md"])
+    fake.routes[f"{GITOPS}/commits/fcb43ac/pulls"] = []
+    deployments = ops.recent_changes(kube, gh, "dev")["deployments"]
+    assert len(deployments) == 1 and deployments[0]["deployed_at"]
 
 
 def test_touches_maps_paths_to_where_they_land():
