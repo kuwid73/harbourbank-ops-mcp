@@ -12,6 +12,8 @@ operational questions about **Harbour Bank**, a fictional bank with synthetic da
 
 It fetches facts. It does no reasoning of its own (there's no LLM inside) and it **cannot change anything**.
 
+A second, separate server in this repo, `harbourbank-change-mcp`, is the agent's only write path: it can open pull requests on harbourbank-gitops, which a person approves. See [The change server](#the-change-server-proposes-never-merges).
+
 ## Tools
 
 | Tool | Answers |
@@ -71,6 +73,42 @@ Add this to `claude_desktop_config.json` (Settings → Developer → Edit Config
   }
 }
 ```
+
+## The change server (proposes, never merges)
+
+`harbourbank-change-mcp` lets the agent fix things the GitOps way: it opens a pull request on
+harbourbank-gitops, and a code owner reviews and merges it, or doesn't. It runs as its own GitHub App,
+**harbourbank-agent**, which can write branches and open PRs on that one repository and nothing else.
+It isn't a bypass actor, so its PRs need a genuine code-owner approval. It has no Kubernetes access: the
+evidence comes from the read-only server.
+
+| Tool | What it does |
+|---|---|
+| `propose_change` | Exact find/replace edits to existing files, as one PR |
+| `propose_revert` | Undo a merged PR, restoring every file it changed (refused if they changed again since) |
+| `record_incident` | A new incident record in `incidents/`, which the DORA metrics read |
+| `my_proposals` | The agent's recent PRs and what became of them (read-only) |
+
+**Limits, enforced in the server, not left to the model:**
+- **What it can change:** only `apps/harbourbank/overlays/<env>/*.yaml`, `apps/harbourbank/base/*.yaml` and `incidents/*.yaml`. CI, bootstrap, platform add-ons and CODEOWNERS are out of reach, including through a revert.
+- **How much:** at most 5 files and about 200 changed lines per PR. Each `find` must match exactly once, and the result must still parse as YAML.
+- **How often:** at most 3 of its PRs open at once, and 5 opened per hour.
+- **What it writes:** PR text is masked like every result, because the repository is public. Every call, including a refused one, is audited in `~/.local/state/harbourbank-ops-mcp/change-audit.jsonl`.
+- **Who it is:** it refuses to start unless GitHub says it is `harbourbank-agent`, installed on harbourbank-gitops only.
+
+**Setup:**
+1. Create the GitHub App: Contents and Pull requests read and write, nothing else, no webhook, installed on harbourbank-gitops only.
+2. Install its key, which also checks it:
+   ```bash
+   scripts/install-github-app-key.sh agent <app-id> <downloaded .pem>
+   ```
+3. Add it to Claude Desktop beside `harbourbank-ops`:
+   ```json
+   "harbourbank-change": {
+     "command": "wsl",
+     "args": ["-e", "/home/<you>/work/ai/agentic/devops/agentic-lab/harbourbank-ops-mcp/.venv/bin/harbourbank-change-mcp"]
+   }
+   ```
 
 ## Delivery metrics (DORA)
 
