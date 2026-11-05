@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Read-only MCP server for operating Harbour Bank (fictional bank, synthetic data)"
 requires-python = ">=3.13"
 dependencies = [
+    "anthropic>=2.5.0",
     "httpx>=0.28.1",
     "mcp>=2.3.0",
     "pyjwt[crypto]>=2.10",
@@ -13,6 +14,7 @@ dependencies = [
 [project.scripts]
 harbourbank-ops-mcp = "harbourbank_ops_mcp.server:main"
 harbourbank-change-mcp = "harbourbank_ops_mcp.change_server:main"
+harbourbank-reviewer = "harbourbank_ops_mcp.reviewer:main"
 hb-delivery = "harbourbank_ops_mcp.delivery:main"
 
 [build-system]

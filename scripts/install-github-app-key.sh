@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Install a GitHub App's private key for the lab and prove it works (run by the engineer).
 #
-#   scripts/install-github-app-key.sh <agent|builder> <app-id> <downloaded .pem>
+#   scripts/install-github-app-key.sh <agent|builder|reviewer> <app-id> <downloaded .pem>
 #
 # The key goes to ~/.config/harbourbank-ops/github-app-<role>.pem (mode 600) with its App ID beside it,
 # and the downloaded copy is removed. The check signs a 1-minute JWT, asks GitHub which App it is and
 # where it is installed, and mints an installation token only to list the repos it can reach. No key
 # or token is ever printed.
 set -euo pipefail
-role=${1:?role: agent or builder}; app_id=${2:?App ID (a number, from the App settings page)}; src=${3:?path to the downloaded .pem}
-case "$role" in agent|builder) ;; *) echo "role must be agent or builder" >&2; exit 1 ;; esac
+role=${1:?role: agent, builder or reviewer}; app_id=${2:?App ID (a number, from the App settings page)}; src=${3:?path to the downloaded .pem}
+case "$role" in agent|builder|reviewer) ;; *) echo "role must be agent, builder or reviewer" >&2; exit 1 ;; esac
 [[ "$app_id" =~ ^[0-9]+$ ]] || { echo "App ID must be a number" >&2; exit 1; }
 grep -Eq "BEGIN (RSA )?PRIVATE KEY" "$src" || { echo "$src is not a GitHub App private key" >&2; exit 1; }
 
