@@ -12,7 +12,7 @@ operational questions about **Harbour Bank**, a fictional bank with synthetic da
 
 It fetches facts. It does no reasoning of its own (there's no LLM inside) and it **cannot change anything**.
 
-A second, separate server in this repo, `harbourbank-change-mcp`, is the agent's only write path: it can open pull requests on harbourbank-gitops, which a person approves. See [The change server](#the-change-server-proposes-never-merges).
+A second, separate server in this repo, `harbourbank-change-mcp`, is the agent's only write path, and `harbourbank-reviewer` checks what it proposes: it can open pull requests on harbourbank-gitops, which a person approves. See [The change server](#the-change-server-proposes-never-merges).
 
 ## Tools
 
@@ -109,6 +109,34 @@ evidence comes from the read-only server.
      "args": ["-e", "/home/<you>/work/ai/agentic/devops/agentic-lab/harbourbank-ops-mcp/.venv/bin/harbourbank-change-mcp"]
    }
    ```
+
+## The reviewer agent (checks, never approves)
+
+`harbourbank-reviewer` is an independent check on every PR the operations agent opens. It never sees
+how a fix was reached, only the PR: its claims, its evidence and its diff. It re-checks those against
+the live systems, then posts a **comment** review. A code owner still decides.
+
+```bash
+harbourbank-reviewer review 26          # review one PR and print the review (dry run)
+harbourbank-reviewer review 26 --post   # ... and post it as harbourbank-reviewer
+harbourbank-reviewer watch              # review each new harbourbank-agent PR, every minute
+```
+
+**Limits, enforced in code:**
+- **Tools:** only the read-only harbourbank-ops tools, run in-process with the same masking and audit. It has no shell, no files and no write path.
+- **On GitHub:** it posts COMMENT reviews only, as its own App, **harbourbank-reviewer**. That App has Contents read-only and Pull requests write, on harbourbank-gitops only. It's not a code owner.
+- **Pinned model:** `claude-sonnet-5-5`, with no fallback.
+  - These all give **no verdict** rather than a guess: an answer from another model, a refusal, an API error, a malformed answer, or 16 turns without one.
+- **Untrusted input:** the PR's text and diff are passed as data, not instructions, and masked before they're sent.
+- **Evidence:** every statement must come from a tool result, the PR or the diff, or be labelled *inferred*.
+- **Audit:** each review's verdict, model, turns, tool calls, tokens and cost go to `reviewer-audit.jsonl`. Its tool calls go to `reviewer-tool-audit.jsonl`.
+
+**Cost:** the first review (#26: 3 turns, 5 tool calls) cost **$0.096**, almost all of it from the prompt cache.
+
+**Setup:**
+1. An Anthropic API key in a workspace for the lab, with an expiry, a spend limit and auto-reload off. Install it with `agentic-lab/tools/install-anthropic-key.sh`, which checks the key against the pinned model for free.
+2. The harbourbank-reviewer App, installed with `scripts/install-github-app-key.sh reviewer <app-id> <.pem>`.
+3. It uses the same observer kubeconfig and read-only GitHub token as harbourbank-ops-mcp.
 
 ## Delivery metrics (DORA)
 
