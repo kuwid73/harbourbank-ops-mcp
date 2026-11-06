@@ -312,12 +312,51 @@ def _pods_with_pulls(kube: Kube, env: str, pods: list[dict]) -> list[dict]:
     return [_pod(p) | {"image_pull": _image_pull(kube, env, p["metadata"]["name"])} for p in pods[:5]]
 
 
+# Each probe timing as shown, with what the kubelet uses when the probe leaves it out.
+_PROBE_TIMING = {"initialDelaySeconds": ("initial_delay_s", 0), "periodSeconds": ("period_s", 10),
+                 "timeoutSeconds": ("timeout_s", 1), "failureThreshold": ("failure_threshold", 3),
+                 "successThreshold": ("success_threshold", 1)}
+
+
+def _probe(probe: dict | None, ports: dict[str, int]) -> dict | str:
+    if not probe:
+        return "not set"
+
+    def port(p):   # a named port is shown with the number it resolves to, or as unresolved
+        return p if isinstance(p, int) else f"{p} ({ports[p]})" if p in ports else f"{p} (no such port)"
+
+    if http := probe.get("httpGet"):
+        check = {"http": f"{http.get('scheme', 'HTTP')} {http.get('path', '/')}", "port": port(http.get("port"))}
+    elif tcp := probe.get("tcpSocket"):
+        check = {"tcp": True, "port": port(tcp.get("port"))}
+    elif grpc := probe.get("grpc"):
+        check = {"grpc": grpc.get("service") or True, "port": port(grpc.get("port"))}
+    elif command := probe.get("exec"):
+        check = {"exec": " ".join(command.get("command", []))}
+    else:
+        check = {"unknown": sorted(probe)}
+    return check | {shown: probe.get(k, default) for k, (shown, default) in _PROBE_TIMING.items()}
+
+
+def _containers(spec: dict) -> list[dict]:
+    """Ports, health probes and resources of each container, as the pods are told to run."""
+    result = []
+    for c in spec.get("containers", []):
+        ports = {p["name"]: p["containerPort"] for p in c.get("ports") or [] if p.get("name")}
+        result.append({"name": c.get("name"), "ports": [p["containerPort"] for p in c.get("ports") or []],
+                       "probes": {kind: _probe(c.get(f"{kind}Probe"), ports)
+                                  for kind in ("readiness", "liveness", "startup")},
+                       "resources": {k: c.get("resources", {}).get(k, {}) for k in ("requests", "limits")}})
+    return result
+
+
 def describe_workload(kube: Kube, env: str, name: str) -> dict:
     ns, name = _ns(env), _name(name)
     if deploy := kube.get_or_none(f"/apis/apps/v1/namespaces/{ns}/deployments/{name}"):
         selector = _selector(deploy["spec"]["selector"].get("matchLabels", {}))
         return {"kind": "Deployment", "name": name,
                 "images": [_split_image(c["image"]) for c in deploy["spec"]["template"]["spec"]["containers"]],
+                "containers": _containers(deploy["spec"]["template"]["spec"]),
                 "replicas": {k: deploy.get("status", {}).get(k, 0) for k in
                              ("replicas", "readyReplicas", "updatedReplicas", "unavailableReplicas")}
                 | {"desired": deploy["spec"].get("replicas")},
@@ -341,7 +380,7 @@ def describe_workload(kube: Kube, env: str, name: str) -> dict:
     if pod := kube.get_or_none(f"/api/v1/namespaces/{ns}/pods/{name}"):
         return {"kind": "Pod", **_pod(pod), "image_pull": _image_pull(kube, env, name),
                 "images": [_split_image(c["image"]) for c in pod["spec"]["containers"]],
-                "events": _events(kube, ns, name)}
+                "containers": _containers(pod["spec"]), "events": _events(kube, ns, name)}
     names = [d["metadata"]["name"] for d in _items(kube, f"/apis/apps/v1/namespaces/{ns}/deployments")]
     names += [c["metadata"]["name"] for c in _items(kube, f"/apis/batch/v1/namespaces/{ns}/cronjobs")]
     return {"error": f"no Deployment, CronJob, Job or Pod named {name!r} in {env}", "available": sorted(names)}
