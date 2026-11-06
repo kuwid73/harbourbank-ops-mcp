@@ -78,8 +78,10 @@ def build(kube: Kube, gh: GitHub, audit: AuditLog) -> MCPServer:
     @g
     def describe_workload(env: Literal["dev", "qa", "prod"], name: str) -> dict:
         """Details of one Deployment, CronJob, Job or Pod by name (e.g. accounts-api, end-of-day,
-        customer-simulator, salary-day): images, replicas, rollout conditions, pods (with where each
-        pod's image came from: already on the node, or downloaded and how long it took), recent runs
+        customer-simulator, salary-day): images, containers (ports; readiness, liveness and startup
+        probes with path, port and timing; resource requests and limits), replicas, rollout conditions,
+        pods (with where each pod's image came from: already on the node, or downloaded and how long it
+        took), recent runs
         (scheduled or manual, retries) and recent events. Lists the available names if it isn't found."""
         return ops.describe_workload(kube, env, name)
 

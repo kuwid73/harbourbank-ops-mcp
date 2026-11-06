@@ -20,7 +20,7 @@ A second, separate server in this repo, `harbourbank-change-mcp`, is the agent's
 |---|---|
 | `bank_status` | each environment on one page: ArgoCD sync/health and last deployment (with its smoke test), accounts-api version and replicas, database, last business day closed, ledger imbalance, firing alerts |
 | `find_problems` | what's wrong now: unhealthy apps, crash-looping/pending/unready pods, recent restarts, failed Jobs, stuck rollouts, databases, nodes, alerts, warning events. Each comes with evidence and a suggested next call |
-| `describe_workload` | one Deployment, CronJob, Job or Pod: images, replicas, conditions, pods (and where each pod's image came from), recent runs (scheduled or manual, retries), events |
+| `describe_workload` | one Deployment, CronJob, Job or Pod: images, containers (ports, readiness/liveness/startup probes with path, port and timing, resource requests and limits), replicas, conditions, pods (and where each pod's image came from), recent runs (scheduled or manual, retries), events |
 | `get_logs` | recent logs of a pod, Deployment or Job (or the previous container, where a crash's cause is) |
 | `search_logs` | stored logs, the Kubernetes event history, and ArgoCD's events about the Harbour Bank apps (Loki), across environments, up to 7 days back |
 | `query_metrics` | any PromQL query, current or as a time series |

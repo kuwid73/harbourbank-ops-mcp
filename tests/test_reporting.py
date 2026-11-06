@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from conftest import commit, pod, ts
+from conftest import commit, deployment, pod, ts
 from harbourbank_ops_mcp import ops
 
 GITOPS = "/repos/kuwid73/harbourbank-gitops"
@@ -189,3 +189,26 @@ def test_describe_workload_says_whether_the_image_was_downloaded_or_already_on_t
     assert pods["accounts-api-new"]["source"].startswith("downloaded")
     assert pods["accounts-api-new"]["took"] == "12m41.605s"
     assert pods["accounts-api-old"]["source"] == "already on the node (no download)"
+
+
+# --- 8. a workload's probes, ports and resources (drill 4: the tool couldn't show a wrong probe path) ----
+
+def test_describe_workload_shows_probe_path_port_and_timing_and_resources(fake, kube):
+    container = {"name": "accounts-api", "image": "ghcr.io/x@sha256:ab",
+                 "ports": [{"name": "http", "containerPort": 8000}],
+                 "readinessProbe": {"httpGet": {"path": "/ready", "port": "http"}, "periodSeconds": 5},
+                 "livenessProbe": {"tcpSocket": {"port": "metrics"}},
+                 "resources": {"requests": {"cpu": "50m", "memory": "128Mi"}, "limits": {"memory": "256Mi"}}}
+    deploy = deployment()
+    deploy["spec"]["template"]["spec"]["containers"] = [container]
+    fake.routes["/apis/apps/v1/namespaces/harbourbank-dev/deployments/accounts-api"] = deploy
+
+    [c] = ops.describe_workload(kube, "dev", "accounts-api")["containers"]
+
+    assert c["ports"] == [8000]
+    assert c["probes"]["readiness"] == {"http": "HTTP /ready", "port": "http (8000)", "initial_delay_s": 0,
+                                        "period_s": 5, "timeout_s": 1, "failure_threshold": 3,
+                                        "success_threshold": 1}   # unset timings shown as the kubelet's defaults
+    assert c["probes"]["liveness"]["port"] == "metrics (no such port)"
+    assert c["probes"]["startup"] == "not set"
+    assert c["resources"] == {"requests": {"cpu": "50m", "memory": "128Mi"}, "limits": {"memory": "256Mi"}}
