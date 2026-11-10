@@ -59,6 +59,25 @@ It needs two credentials, created by a person and kept outside the repo with mod
 
 Override the paths with `HBOPS_KUBECONFIG`, `HBOPS_GITHUB_TOKEN_FILE` and `HBOPS_AUDIT_LOG`.
 
+### The release copy: the agents only run merged code
+
+Claude Desktop and the reviewer don't run a working copy, where unmerged work would go live on the next
+restart. They run a **release copy** at `~/.local/share/harbourbank-ops-mcp`:
+- a fresh clone from GitHub
+- checked out at a commit on `main`
+- installed non-editable, with the versions in `uv.lock`
+
+A person updates it after a merge:
+
+```bash
+tools/release-ops-mcp.sh            # in the lab folder: release the latest main
+tools/release-ops-mcp.sh <commit>   # roll back (or forward) to a commit on main
+```
+
+It refuses a commit that isn't on `main`, and a copy with local edits. It records what it released in
+`RELEASE`. The running servers change only when Claude Desktop restarts, as does the reviewer's
+`watch`.
+
 ### Claude Desktop (Windows, with the server running in WSL)
 
 Add this to `claude_desktop_config.json` (Settings → Developer → Edit Config), then restart Claude Desktop:
@@ -68,7 +87,7 @@ Add this to `claude_desktop_config.json` (Settings → Developer → Edit Config
   "mcpServers": {
     "harbourbank-ops": {
       "command": "wsl",
-      "args": ["-e", "/home/<you>/work/ai/agentic/devops/agentic-lab/harbourbank-ops-mcp/.venv/bin/harbourbank-ops-mcp"]
+      "args": ["-e", "/home/<you>/.local/share/harbourbank-ops-mcp/.venv/bin/harbourbank-ops-mcp"]
     }
   }
 }
@@ -106,7 +125,7 @@ evidence comes from the read-only server.
    ```json
    "harbourbank-change": {
      "command": "wsl",
-     "args": ["-e", "/home/<you>/work/ai/agentic/devops/agentic-lab/harbourbank-ops-mcp/.venv/bin/harbourbank-change-mcp"]
+     "args": ["-e", "/home/<you>/.local/share/harbourbank-ops-mcp/.venv/bin/harbourbank-change-mcp"]
    }
    ```
 
@@ -117,6 +136,7 @@ how a fix was reached, only the PR: its claims, its evidence and its diff. It re
 the live systems, then posts a **comment** review. A code owner still decides.
 
 ```bash
+cd ~/.local/share/harbourbank-ops-mcp && . .venv/bin/activate   # the release copy
 harbourbank-reviewer review 26          # review one PR and print the review (dry run)
 harbourbank-reviewer review 26 --post   # ... and post it as harbourbank-reviewer
 harbourbank-reviewer watch              # review each new harbourbank-agent PR, every minute
