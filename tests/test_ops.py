@@ -133,6 +133,37 @@ def test_find_problems_spots_crashes_failed_jobs_and_stuck_rollouts(fake, kube):
     assert crash["next_step"] == "get_logs(env='prod', workload='accounts-api-2', previous=True)"
 
 
+def test_restarts_from_a_node_restart_are_one_low_note_but_a_crash_still_counts(fake, kube):
+    """10 Nov: the first hour after a lab start reported 11 "problems", every pod's container lost
+    when its node stopped (Unknown, exit 255). A real crash in the same hour must still show."""
+    finished = (datetime.now(UTC) - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    lost = {"reason": "Unknown", "exitCode": 255, "finishedAt": finished}
+    fake.routes["/api/v1/namespaces/harbourbank-dev/pods"] = {"items": [pod("accounts-api-1", last=lost),
+                                                                        pod("accounts-db-1", last=lost)]}
+    fake.routes["/api/v1/namespaces/harbourbank-prod/pods"] = {"items": [
+        pod("accounts-db-2", last=lost),
+        pod("accounts-api-2", last={"reason": "OOMKilled", "exitCode": 137, "finishedAt": finished})]}
+
+    result = ops.find_problems(kube)
+
+    [note] = [p for p in result["problems"] if p["kind"] == "pods"]
+    assert note["severity"] == "low" and note["object"] == "3 pods"
+    assert note["summary"].startswith("restarted with their node, not a crash")
+    assert {(x["env"], x["pod"]) for x in note["evidence"]["pods"]} == {
+        ("dev", "accounts-api-1"), ("dev", "accounts-db-1"), ("prod", "accounts-db-2")}
+    [crash] = [p for p in result["problems"] if p["kind"] == "pod"]
+    assert (crash["severity"], crash["object"]) == ("medium", "accounts-api-2")
+    assert "OOMKilled, exit 137" in crash["summary"]
+    assert result["healthy"] is False                     # the crash still makes it unhealthy
+
+
+def test_a_node_restart_alone_leaves_the_bank_healthy(fake, kube):
+    finished = (datetime.now(UTC) - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    fake.routes["/api/v1/namespaces/harbourbank-qa/pods"] = {"items": [
+        pod("accounts-api-1", last={"reason": "Unknown", "exitCode": 255, "finishedAt": finished})]}
+    assert ops.find_problems(kube)["healthy"] is True
+
+
 def test_alerts_from_other_namespaces_are_out_of_scope(fake, kube):
     fake.prometheus["ALERTS"] = [{"metric": {"alertname": "KubeControllerDown", "namespace": "kube-system"},
                                   "value": [0, "1"]}]

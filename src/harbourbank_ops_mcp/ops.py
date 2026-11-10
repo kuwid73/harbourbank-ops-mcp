@@ -176,6 +176,12 @@ def _pod(pod: dict) -> dict:
     return summary
 
 
+def _lost_with_node(terminated: dict) -> bool:
+    """Kubernetes never saw the container exit: its node or container runtime went away underneath it.
+    An app's own crash has a real reason and exit code (Error, OOMKilled, 1, 137...)."""
+    return terminated.get("reason") == "Unknown" and terminated.get("exit_code") == 255
+
+
 def _selector(match_labels: dict) -> str:
     return ",".join(f"{k}={v}" for k, v in sorted(match_labels.items()))
 
@@ -232,6 +238,7 @@ def find_problems(kube: Kube, env: str | None = None) -> dict:
             problem["next_step"] = next_step
         problems.append(problem)
 
+    lost_with_node = []
     for e in envs:
         ns = _ns(e)
         app = _argo_app(kube, e)
@@ -254,8 +261,11 @@ def find_problems(kube: Kube, env: str | None = None) -> dict:
             last = p.get("last_terminated")
             if last and last.get("finished") and _now() - datetime.fromisoformat(
                     last["finished"].replace("Z", "+00:00")) < timedelta(hours=1):
-                add("medium", e, "pod", p["pod"], f"restarted in the last hour ({last['reason']}, "
-                    f"exit {last['exit_code']})", f"get_logs(env='{e}', workload='{p['pod']}', previous=True)")
+                if _lost_with_node(last):
+                    lost_with_node.append({"env": e, "pod": p["pod"], "node": p["node"], "at": last["finished"]})
+                else:
+                    add("medium", e, "pod", p["pod"], f"restarted in the last hour ({last['reason']}, "
+                        f"exit {last['exit_code']})", f"get_logs(env='{e}', workload='{p['pod']}', previous=True)")
         for job in _items(kube, f"/apis/batch/v1/namespaces/{ns}/jobs"):
             for cond in job.get("status", {}).get("conditions", []):
                 if cond.get("type") == "Failed" and cond.get("status") == "True":
@@ -275,6 +285,13 @@ def find_problems(kube: Kube, env: str | None = None) -> dict:
         if recent:
             add("low", e, "events", ns, f"{len(recent)} warning events in the last 15 minutes", events=recent[:10])
 
+    if lost_with_node:
+        times = sorted(x["at"] for x in lost_with_node)
+        when = f"at {times[0]}" if times[0] == times[-1] else f"between {times[0]} and {times[-1]}"
+        add("low", None, "pods", f"{len(lost_with_node)} pods",
+            f"restarted with their node, not a crash: {len(lost_with_node)} pods lost their containers "
+            f"{when} (Unknown, exit 255: the node or its container runtime "
+            "restarted underneath them, as when the lab is stopped and started)", pods=lost_with_node[:20])
     for node in _items(kube, "/api/v1/nodes"):
         ready = next((c for c in node["status"].get("conditions", []) if c["type"] == "Ready"), {})
         if ready.get("status") != "True":
