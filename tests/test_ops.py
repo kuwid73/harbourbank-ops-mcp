@@ -2,10 +2,12 @@ import time
 from datetime import UTC, datetime, timedelta
 
 import anyio
+import httpx
 import pytest
 
 from conftest import commit, deployment, pod, ts
 from harbourbank_ops_mcp import ops, server
+from harbourbank_ops_mcp.clients import Kube
 from harbourbank_ops_mcp.safety import AuditLog
 
 
@@ -230,3 +232,90 @@ def test_server_refuses_to_start_with_any_other_identity(fake, kube, monkeypatch
     monkeypatch.setattr(server.Kube, "from_kubeconfig", classmethod(lambda cls, path: kube))
     with pytest.raises(SystemExit, match="refusing to start as 'kubernetes-admin'"):
         server.main()
+
+
+# --- NetworkPolicies (drill 5, 2026-11-11: a policy cut accounts-api off from fraud-check) ---------
+
+def _labelled(p, **labels):
+    p["metadata"]["labels"] = labels
+    return p
+
+
+def _policy(caller_labels):
+    return {"metadata": {"name": "fraud-check"}, "spec": {
+        "podSelector": {"matchLabels": {"name": "fraud-check"}}, "policyTypes": ["Ingress"],
+        "ingress": [{"from": [{"podSelector": {"matchLabels": caller_labels}},
+                              {"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "monitoring"}}}],
+                     "ports": [{"port": "http"}]}]}}
+
+
+def _bank_with_fraud_check(fake, caller_labels):
+    ns = "harbourbank-dev"
+    api, fraud = deployment(), deployment("fraud-check")
+    api["spec"]["template"]["metadata"] = {"labels": {"name": "accounts-api"}}
+    api["metadata"]["labels"] = {"name": "accounts-api", "part-of": "harbourbank"}   # the object, not its pods
+    fraud["spec"]["template"]["metadata"] = {"labels": {"name": "fraud-check"}}
+    fake.routes[f"/apis/apps/v1/namespaces/{ns}/deployments/accounts-api"] = api
+    fake.routes[f"/apis/apps/v1/namespaces/{ns}/deployments/fraud-check"] = fraud
+    fake.routes[f"/api/v1/namespaces/{ns}/pods"] = {"items": [
+        _labelled(pod("accounts-api-1"), name="accounts-api"), _labelled(pod("fraud-check-1"), name="fraud-check"),
+        _labelled(pod("old-job", phase="Succeeded"), name="accounts-api", **{"part-of": "harbourbank"})]}
+    fake.routes[f"/apis/networking.k8s.io/v1/namespaces/{ns}/networkpolicies"] = {"items": [_policy(caller_labels)]}
+
+
+def test_describe_workload_shows_who_a_policy_lets_in(fake, kube):
+    _bank_with_fraud_check(fake, {"name": "accounts-api"})
+
+    fraud = ops.describe_workload(kube, "dev", "fraud-check")
+    assert fraud["pod_labels"] == {"name": "fraud-check"}
+    rule = fraud["network"]["protected_by"][0]["allows_in"][0]
+    assert rule["from"][0] == {"pods": "name=accounts-api", "matching_now": ["accounts-api-1"]}
+    assert rule["from"][1] == {"namespaces": "kubernetes.io/metadata.name=monitoring"}
+    assert rule["ports"] == ["http"]
+
+    api = ops.describe_workload(kube, "dev", "accounts-api")
+    assert api["network"]["protected_by"].startswith("no NetworkPolicy selects these pods")
+    assert api["network"]["as_a_caller"] == [{"policy": "fraud-check", "protects_pods": "name=fraud-check",
+                                              "admits_this_workload": True, "admits_pods": ["name=accounts-api"]}]
+    assert ops.find_problems(kube, "dev")["healthy"]
+
+
+def test_a_policy_that_requires_a_label_no_pod_carries_is_found(fake, kube):
+    """Drill 5: the Deployment object carries part-of, its pods do not; every pod stays healthy."""
+    _bank_with_fraud_check(fake, {"name": "accounts-api", "part-of": "harbourbank"})
+
+    api = ops.describe_workload(kube, "dev", "accounts-api")
+    assert api["pod_labels"] == {"name": "accounts-api"}
+    assert api["network"]["as_a_caller"][0]["admits_this_workload"] is False
+    peer = ops.describe_workload(kube, "dev", "fraud-check")["network"]["protected_by"][0]["allows_in"][0]["from"][0]
+    assert peer["matching_now"] == [] and "admits nobody" in peer["warning"]   # the finished Job's pod doesn't count
+
+    result = ops.find_problems(kube, "dev")
+    problem = next(p for p in result["problems"] if p["kind"] == "network_policy")
+    assert not result["healthy"] and problem["severity"] == "medium" and problem["object"] == "fraud-check"
+    assert "name=accounts-api,part-of=harbourbank" in problem["summary"] and "fraud-check-1" in problem["summary"]
+    assert problem["next_step"] == "describe_workload(env='dev', name='fraud-check-1')"
+
+
+def test_without_permission_to_read_policies_the_tools_say_so_and_carry_on(fake, kube):
+    _bank_with_fraud_check(fake, {"name": "accounts-api", "part-of": "harbourbank"})
+    path = "/apis/networking.k8s.io/v1/namespaces/harbourbank-dev/networkpolicies"
+    original = fake.handle
+
+    def forbidden(request):
+        if request.url.path == path:
+            fake.requests.append(request)
+            return httpx.Response(403, json={"message": "networkpolicies is forbidden"})
+        return original(request)
+    denied = Kube("https://k8s.test", "token", transport=httpx.MockTransport(forbidden))
+
+    assert "no permission" in ops.describe_workload(denied, "dev", "accounts-api")["network"]["unavailable"]
+    assert ops.find_problems(denied, "dev")["healthy"]
+
+
+def test_a_policy_protecting_nothing_running_is_not_a_problem(fake, kube):
+    """qa and prod: fraud-check has 0 replicas, and its policy's callers may differ. Nothing is cut off."""
+    _bank_with_fraud_check(fake, {"name": "nobody"})
+    fake.routes["/api/v1/namespaces/harbourbank-dev/pods"] = {"items": [_labelled(pod("accounts-api-1"),
+                                                                                  name="accounts-api")]}
+    assert ops.find_problems(kube, "dev")["healthy"]

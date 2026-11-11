@@ -186,6 +186,104 @@ def _selector(match_labels: dict) -> str:
     return ",".join(f"{k}={v}" for k, v in sorted(match_labels.items()))
 
 
+def _matches(selector: dict | None, labels: dict) -> bool:
+    """A Kubernetes label selector against one pod's labels. An empty selector matches every pod."""
+    selector = selector or {}
+    for key, value in (selector.get("matchLabels") or {}).items():
+        if labels.get(key) != value:
+            return False
+    for e in selector.get("matchExpressions") or []:
+        key, values = e.get("key"), e.get("values") or []
+        ok = {"In": labels.get(key) in values, "NotIn": labels.get(key) not in values,
+              "Exists": key in labels, "DoesNotExist": key not in labels}.get(e.get("operator"), False)
+        if not ok:
+            return False
+    return True
+
+
+def _selector_text(selector: dict | None) -> str:
+    selector = selector or {}
+    parts = [f"{k}={v}" for k, v in sorted((selector.get("matchLabels") or {}).items())]
+    parts += [f"{e.get('key')} {e.get('operator')} {e.get('values') or ''}".strip()
+              for e in selector.get("matchExpressions") or []]
+    return ",".join(parts) or "(all pods)"
+
+
+def _labels(pod: dict) -> dict:
+    return pod.get("metadata", {}).get("labels") or {}
+
+
+def _network_policies(kube: Kube, ns: str) -> list[dict] | None:
+    """The namespace's NetworkPolicies, or None when this identity may not read them."""
+    try:
+        return _items(kube, f"/apis/networking.k8s.io/v1/namespaces/{ns}/networkpolicies")
+    except ApiError as exc:
+        if exc.status == 403:
+            return None
+        raise
+
+
+def _running(pods: list[dict]) -> list[dict]:
+    return [p for p in pods if p.get("status", {}).get("phase") not in ("Succeeded", "Failed")]
+
+
+def _peer(peer: dict, pods: list[dict]) -> dict:
+    """One `from`/`to` entry of a policy rule. A pod selector without a namespace selector means
+    pods of this same namespace: say which running pods carry those labels right now."""
+    if "ipBlock" in peer:
+        return {"ip_block": peer["ipBlock"]}
+    if "namespaceSelector" in peer:
+        return {"namespaces": _selector_text(peer["namespaceSelector"]),
+                **({"pods": _selector_text(peer["podSelector"])} if "podSelector" in peer else {})}
+    names = sorted(p["metadata"]["name"] for p in pods if _matches(peer.get("podSelector"), _labels(p)))
+    return {"pods": _selector_text(peer.get("podSelector")), "matching_now": names[:10],
+            **({"warning": "no running pod in this namespace carries these labels, so this entry admits nobody"}
+               if not names else {})}
+
+
+def _rules(rules: list[dict] | None, key: str, pods: list[dict]) -> list[dict]:
+    return [{key: [_peer(x, pods) for x in r.get(key) or []] or "anyone",
+             "ports": [x.get("port") for x in r.get("ports") or []] or "all"} for r in rules or []]
+
+
+def _policy_types(policy: dict) -> list[str]:
+    spec = policy.get("spec", {})
+    return spec.get("policyTypes") or (["Ingress", "Egress"] if "egress" in spec else ["Ingress"])
+
+
+def _network(kube: Kube, ns: str, labels: dict) -> dict:
+    """What NetworkPolicies mean for pods carrying `labels`: which policies protect them and who
+    those let in, and whether the policies protecting other pods admit them as a caller."""
+    policies = _network_policies(kube, ns)
+    if policies is None:
+        return {"unavailable": "this identity has no permission to read NetworkPolicies"}
+    pods = _running(_items(kube, f"/api/v1/namespaces/{ns}/pods"))
+    protected_by, as_a_caller = [], []
+    for policy in policies:
+        spec, name, types = policy.get("spec", {}), policy["metadata"]["name"], _policy_types(policy)
+        if _matches(spec.get("podSelector"), labels):
+            entry = {"policy": name, "policy_types": types}
+            if "Ingress" in types:
+                entry["allows_in"] = _rules(spec.get("ingress"), "from", pods) or "nothing"
+            if "Egress" in types:
+                entry["allows_out"] = _rules(spec.get("egress"), "to", pods) or "nothing"
+            protected_by.append(entry)
+        elif "Ingress" in types:
+            peers = [x for r in spec.get("ingress") or [] for x in r.get("from") or []]
+            open_rule = any(not r.get("from") for r in spec.get("ingress") or [])
+            admitted = open_rule or any("namespaceSelector" not in x and "ipBlock" not in x
+                                        and _matches(x.get("podSelector"), labels) for x in peers)
+            as_a_caller.append({"policy": name, "protects_pods": _selector_text(spec.get("podSelector")),
+                                "admits_this_workload": admitted,
+                                "admits_pods": [_selector_text(x.get("podSelector")) for x in peers
+                                                if "namespaceSelector" not in x and "ipBlock" not in x]})
+    return {"protected_by": protected_by or "no NetworkPolicy selects these pods: all traffic to them is allowed",
+            "as_a_caller": as_a_caller,
+            "note": "Pods no policy selects accept all traffic. A policy matches POD labels (pod_labels), not the "
+                    "labels of the Deployment object. In this cluster a blocked connection is refused at once "
+                    "(connection refused), not timed out."}
+
+
 def _events(kube: Kube, namespace: str, name_prefix: str | None = None, limit: int = 20) -> list[dict]:
     events = _items(kube, f"/api/v1/namespaces/{namespace}/events")
     if name_prefix:
@@ -245,7 +343,25 @@ def find_problems(kube: Kube, env: str | None = None) -> dict:
         if app["sync"] != "Synced" or app["health"] != "Healthy" or app["last_sync"]["phase"] in ("Failed", "Error"):
             add("high", e, "argocd", f"harbourbank-{e}", f"ArgoCD app is {app['sync']}/{app['health']}, "
                 f"last sync {app['last_sync']['phase']}", message=app["last_sync"]["message"])
-        for pod in _items(kube, f"/api/v1/namespaces/{ns}/pods"):
+        pods = _items(kube, f"/api/v1/namespaces/{ns}/pods")
+        running = _running(pods)
+        for policy in _network_policies(kube, ns) or []:
+            spec = policy.get("spec", {})
+            protected = sorted(p["metadata"]["name"] for p in running if _matches(spec.get("podSelector"), _labels(p)))
+            if not protected or "Ingress" not in _policy_types(policy):
+                continue
+            for rule in spec.get("ingress") or []:
+                for peer in rule.get("from") or []:
+                    if "namespaceSelector" in peer or "ipBlock" in peer:
+                        continue
+                    if not any(_matches(peer.get("podSelector"), _labels(p)) for p in running):
+                        add("medium", e, "network_policy", policy["metadata"]["name"],
+                            f"a rule admits pods labelled {_selector_text(peer.get('podSelector'))}, but no running "
+                            f"pod in {e} carries those labels: whoever it was meant for cannot reach "
+                            f"{', '.join(protected[:3])}",
+                            f"describe_workload(env='{e}', name='{protected[0]}')",
+                            admits_pods=_selector_text(peer.get("podSelector")), protects=protected[:5])
+        for pod in pods:
             p = _pod(pod)
             if p["phase"] == "Succeeded":
                 continue
@@ -371,7 +487,9 @@ def describe_workload(kube: Kube, env: str, name: str) -> dict:
     ns, name = _ns(env), _name(name)
     if deploy := kube.get_or_none(f"/apis/apps/v1/namespaces/{ns}/deployments/{name}"):
         selector = _selector(deploy["spec"]["selector"].get("matchLabels", {}))
+        pod_labels = deploy["spec"]["template"].get("metadata", {}).get("labels") or {}
         return {"kind": "Deployment", "name": name,
+                "pod_labels": pod_labels, "network": _network(kube, ns, pod_labels),
                 "images": [_split_image(c["image"]) for c in deploy["spec"]["template"]["spec"]["containers"]],
                 "containers": _containers(deploy["spec"]["template"]["spec"]),
                 "replicas": {k: deploy.get("status", {}).get(k, 0) for k in
@@ -395,7 +513,8 @@ def describe_workload(kube: Kube, env: str, name: str) -> dict:
         pods = _items(kube, f"/api/v1/namespaces/{ns}/pods", labelSelector=f"batch.kubernetes.io/job-name={name}")
         return {"kind": "Job", **_job(job), "pods": [_pod(p) for p in pods], "events": _events(kube, ns, name)}
     if pod := kube.get_or_none(f"/api/v1/namespaces/{ns}/pods/{name}"):
-        return {"kind": "Pod", **_pod(pod), "image_pull": _image_pull(kube, env, name),
+        return {"kind": "Pod", **_pod(pod), "pod_labels": _labels(pod), "network": _network(kube, ns, _labels(pod)),
+                "image_pull": _image_pull(kube, env, name),
                 "images": [_split_image(c["image"]) for c in pod["spec"]["containers"]],
                 "containers": _containers(pod["spec"]), "events": _events(kube, ns, name)}
     names = [d["metadata"]["name"] for d in _items(kube, f"/apis/apps/v1/namespaces/{ns}/deployments")]
