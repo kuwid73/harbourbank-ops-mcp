@@ -69,8 +69,9 @@ def build(kube: Kube, gh: GitHub, audit: AuditLog) -> MCPServer:
     @g
     def find_problems(env: Literal["dev", "qa", "prod"] | None = None) -> dict:
         """What is wrong right now: unhealthy ArgoCD apps, crash-looping/pending/unready pods, recent
-        restarts, failed Jobs, stuck rollouts, unhealthy databases, NotReady nodes, firing alerts and
-        recent warning events. Each problem includes evidence and a suggested next tool call.
+        restarts, failed Jobs, stuck rollouts, unhealthy databases, NotReady nodes, firing alerts,
+        NetworkPolicy rules that admit pods by labels no running pod carries, and recent warning
+        events. Each problem includes evidence and a suggested next tool call.
         Omit env to check all three."""
         return ops.find_problems(kube, env)
 
@@ -82,7 +83,10 @@ def build(kube: Kube, gh: GitHub, audit: AuditLog) -> MCPServer:
         probes with path, port and timing; resource requests and limits), replicas, rollout conditions,
         pods (with where each pod's image came from: already on the node, or downloaded and how long it
         took), recent runs
-        (scheduled or manual, retries) and recent events. Lists the available names if it isn't found."""
+        (scheduled or manual, retries) and recent events. For a Deployment or Pod also the pods' labels
+        and `network`: the NetworkPolicies protecting it, who each rule lets in (with the pods matching
+        right now) and whether other workloads' policies admit it as a caller. Use it when one service
+        cannot reach another although both are healthy. Lists the available names if it isn't found."""
         return ops.describe_workload(kube, env, name)
 
     @tool(annotations=READ_ONLY)

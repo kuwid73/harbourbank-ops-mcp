@@ -73,6 +73,7 @@ class Fake:
             self.routes[f"/api/v1/namespaces/{ns}/events"] = {"items": []}
             self.routes[f"/apis/batch/v1/namespaces/{ns}/jobs"] = {"items": []}
             self.routes[f"/apis/batch/v1/namespaces/{ns}/cronjobs"] = {"items": []}
+            self.routes[f"/apis/networking.k8s.io/v1/namespaces/{ns}/networkpolicies"] = {"items": []}
         self.routes["/api/v1/nodes"] = {"items": [{"metadata": {"name": "agent-0"},
                                                    "status": {"conditions": [{"type": "Ready", "status": "True"}]}}]}
 
