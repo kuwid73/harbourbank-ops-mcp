@@ -70,8 +70,10 @@ def build(kube: Kube, gh: GitHub, audit: AuditLog) -> MCPServer:
     def find_problems(env: Literal["dev", "qa", "prod"] | None = None) -> dict:
         """What is wrong right now: unhealthy ArgoCD apps, crash-looping/pending/unready pods, recent
         restarts, failed Jobs, stuck rollouts, unhealthy databases, NotReady nodes, firing alerts,
-        NetworkPolicy rules that admit pods by labels no running pod carries, and recent warning
-        events. Each problem includes evidence and a suggested next tool call.
+        NetworkPolicy rules that admit pods by labels no running pod carries, NetworkPolicies changed
+        in the last 6 hours (low severity: a rule that admits the wrong workload looks valid, so check
+        it when a caller is failing), and recent warning events. Each problem includes evidence and a
+        suggested next tool call.
         Omit env to check all three."""
         return ops.find_problems(kube, env)
 

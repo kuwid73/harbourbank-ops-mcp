@@ -297,6 +297,32 @@ def test_a_policy_that_requires_a_label_no_pod_carries_is_found(fake, kube):
     assert problem["next_step"] == "describe_workload(env='dev', name='fraud-check-1')"
 
 
+def test_a_recently_changed_policy_that_admits_the_wrong_workload_is_pointed_out(fake, kube):
+    """Drill of 2026-11-13: the rule admitted customer-simulator instead of accounts-api. Its selector
+    matches a real pod, so nothing is "wrong" with it: only that it changed minutes ago."""
+    from datetime import UTC, datetime, timedelta
+    ns = "harbourbank-dev"
+    _bank_with_fraud_check(fake, {"name": "customer-simulator"})
+    fake.routes[f"/api/v1/namespaces/{ns}/pods"]["items"].append(
+        _labelled(pod("customer-simulator-1"), name="customer-simulator"))
+    policy = fake.routes[f"/apis/networking.k8s.io/v1/namespaces/{ns}/networkpolicies"]["items"][0]
+    stamp = lambda ago: (datetime.now(UTC) - ago).strftime("%Y-%m-%dT%H:%M:%SZ")   # noqa: E731
+    policy["metadata"]["creationTimestamp"] = stamp(timedelta(days=3))
+    policy["metadata"]["managedFields"] = [{"manager": "argocd-controller", "time": stamp(timedelta(minutes=9))}]
+
+    result = ops.find_problems(kube, "dev")
+    problem = next(p for p in result["problems"] if p["kind"] == "network_policy_changed")
+    assert result["healthy"]                                    # a hint, not a fault by itself
+    assert problem["severity"] == "low" and problem["object"] == "fraud-check"
+    assert "changed 9m ago" in problem["summary"] and "name=customer-simulator" in problem["summary"]
+    assert problem["evidence"]["admits_pods"] == ["name=customer-simulator"]
+    assert problem["next_step"] == "describe_workload(env='dev', name='fraud-check-1')"
+    assert not any(p["kind"] == "network_policy" for p in result["problems"])   # the selector matches a pod
+
+    policy["metadata"]["managedFields"][0]["time"] = stamp(timedelta(hours=7))  # old news: say nothing
+    assert not ops.find_problems(kube, "dev")["problems"]
+
+
 def test_without_permission_to_read_policies_the_tools_say_so_and_carry_on(fake, kube):
     _bank_with_fraud_check(fake, {"name": "accounts-api", "part-of": "harbourbank"})
     path = "/apis/networking.k8s.io/v1/namespaces/harbourbank-dev/networkpolicies"
