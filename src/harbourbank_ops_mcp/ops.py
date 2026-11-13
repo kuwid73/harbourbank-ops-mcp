@@ -22,6 +22,8 @@ REPOS = {"gitops": "kuwid73/harbourbank-gitops", "app": "kuwid73/harbourbank-app
 PROMETHEUS = ("monitoring", "kube-prometheus-stack-prometheus:9090")
 LOKI = ("monitoring", "loki:3100")
 API = "accounts-api"
+# A NetworkPolicy changed this recently is worth a look when something cannot be reached
+POLICY_CHANGE_WINDOW = timedelta(hours=6)
 IMAGE = "ghcr.io/kuwid73/harbourbank-accounts-api"
 
 MAX_LOG_LINES = 500
@@ -246,6 +248,15 @@ def _rules(rules: list[dict] | None, key: str, pods: list[dict]) -> list[dict]:
              "ports": [x.get("port") for x in r.get("ports") or []] or "all"} for r in rules or []]
 
 
+def _last_changed(obj: dict) -> datetime | None:
+    """When the object was last written: the newest managedFields time (an apply that changes
+    nothing leaves it alone), else its creation time."""
+    meta = obj.get("metadata", {})
+    times = [f["time"] for f in meta.get("managedFields") or [] if f.get("time")]
+    stamp = max(times) if times else meta.get("creationTimestamp")
+    return datetime.fromisoformat(stamp.replace("Z", "+00:00")) if stamp else None
+
+
 def _policy_types(policy: dict) -> list[str]:
     spec = policy.get("spec", {})
     return spec.get("policyTypes") or (["Ingress", "Egress"] if "egress" in spec else ["Ingress"])
@@ -350,6 +361,18 @@ def find_problems(kube: Kube, env: str | None = None) -> dict:
             protected = sorted(p["metadata"]["name"] for p in running if _matches(spec.get("podSelector"), _labels(p)))
             if not protected or "Ingress" not in _policy_types(policy):
                 continue
+            changed = _last_changed(policy)
+            if changed and _now() - changed < POLICY_CHANGE_WINDOW:
+                # A rule that admits the wrong (but real) workload looks valid: only its timing gives it away
+                admits = [_selector_text(x.get("podSelector")) for r in spec.get("ingress") or []
+                          for x in r.get("from") or [] if "namespaceSelector" not in x and "ipBlock" not in x]
+                add("low", e, "network_policy_changed", policy["metadata"]["name"],
+                    f"NetworkPolicy changed {_age(changed.isoformat())} ago. It protects {', '.join(protected[:3])} "
+                    f"and admits pods labelled {' or '.join(admits) or '(none in this namespace)'}. A workload "
+                    f"that calls {protected[0]} but does not carry those labels is refused: if a caller started "
+                    "failing around then, this is the first place to look",
+                    f"describe_workload(env='{e}', name='{protected[0]}')",
+                    changed_at=changed.isoformat(timespec="seconds"), admits_pods=admits, protects=protected[:5])
             for rule in spec.get("ingress") or []:
                 for peer in rule.get("from") or []:
                     if "namespaceSelector" in peer or "ipBlock" in peer:
