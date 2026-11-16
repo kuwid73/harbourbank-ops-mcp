@@ -24,7 +24,7 @@ A second, separate server in this repo, `harbourbank-change-mcp`, is the agent's
 | `get_logs` | recent logs of a pod, Deployment or Job (or the previous container, where a crash's cause is) |
 | `search_logs` | stored logs, the Kubernetes event history, and ArgoCD's events about the Harbour Bank apps (Loki), across environments, up to 7 days back |
 | `query_metrics` | any PromQL query, current or as a time series |
-| `recent_changes` | deployments to an environment: every commit each one shipped, where each commit lands, who made it (human or CI), and its pull request (merger, reviews, independent approval) |
+| `recent_changes` | deployments to an environment: every commit each one shipped, where each commit lands, who made it, and its pull request (who opened it: the pipeline, an AI agent or a person; merger, reviews, independent approval) |
 | `compare_environments` | what's in one environment's build that another doesn't have yet |
 | `end_of_day_status` | the nightly batch: business day closed, interest paid, whether the books balance, the next run, recent runs (scheduled or manual, how late, retries), and every failed attempt's error |
 | `change_audit` | GitHub's record of every push to `main`: rules passed, bypassed or blocked; who really made each change (a CI deploy key pushes as the repo owner); the PR's reviews; when the rules came into force |
