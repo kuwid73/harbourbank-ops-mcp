@@ -42,6 +42,10 @@ small for a baseline (its read_first), say so first, before any level, and quote
 indicative, as given.
 Say which kinds of deployment the failures came from. Modelled scenarios are not this server's
 business: never present a simulation as a measurement.
+A change's made_by says who opened it (the pipeline, one of the AI agents, or a person): repeat it
+as given, and do not call an agent "CI".
+Logs give money in cents with no currency: quote amounts as plain units (5000 cents is 50.00) and
+name a currency only when a result states it.
 Personal data and secrets are masked in all results; say so if a question needs them."""
 
 READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True,
@@ -130,9 +134,10 @@ def build(kube: Kube, gh: GitHub, audit: AuditLog) -> MCPServer:
     def recent_changes(env: Literal["dev", "qa", "prod"], days: int = 7) -> dict:
         """Deployments to an environment, newest first: when ArgoCD deployed, every GitOps commit each
         deployment shipped, where each commit lands ('touches': which environments, or platform/docs),
-        who made it (human or CI bot), and its pull request (who merged it, reviews, independent
-        approval). A sync still running or failed comes first with deployed_at null and its status:
-        its commits are on main but not running. Answers "what changed and who approved it". Up to 30 days."""
+        who made it, and its pull request (who opened it: the pipeline, the operator or builder agent, or
+        a person; who merged it, reviews, independent approval). A sync still running or failed comes
+        first with deployed_at null and its status: its commits are on main but not running. Answers
+        "what changed and who approved it". Up to 30 days."""
         return ops.recent_changes(kube, gh, env, days)
 
     @tool(annotations=READ_ONLY)

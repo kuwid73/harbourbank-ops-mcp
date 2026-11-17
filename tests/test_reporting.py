@@ -82,7 +82,22 @@ def test_a_bot_made_pr_approved_by_a_person_has_an_independent_approval(fake, gh
                                         "merged_by": {"login": "kuwid73"}, "merged_at": ts()}
     fake.routes[f"{GITOPS}/pulls/5/reviews"] = [{"user": {"login": "kuwid73"}, "state": "APPROVED"}]
     pr = ops._pull_request(gh, "kuwid73/harbourbank-gitops", 5)
-    assert pr["made_by"] == "bot (CI)" and pr["independent_approval_by"] == ["kuwid73"]
+    assert pr["made_by"].startswith("the delivery pipeline") and pr["independent_approval_by"] == ["kuwid73"]
+
+
+def test_a_pull_request_says_which_agent_or_person_opened_it(fake, gh):
+    """Drills of 13 and 16 November: the operator called harbourbank-builder "the CI bot"."""
+    def opened_by(login, user_type="Bot"):
+        fake.routes[f"{GITOPS}/pulls/52"] = {"title": "dev: fail fast", "user": {"login": login, "type": user_type},
+                                             "merged_by": {"login": "kuwid73"}, "merged_at": ts()}
+        fake.routes[f"{GITOPS}/pulls/52/reviews"] = []
+        return ops._pull_request(gh, "kuwid73/harbourbank-gitops", 52)["made_by"]
+
+    assert opened_by("harbourbank-builder[bot]").startswith("the builder agent (harbourbank-builder")
+    assert opened_by("harbourbank-agent[bot]").startswith("the operator agent (harbourbank-agent")
+    assert opened_by("dependabot[bot]") == "a bot (dependabot[bot])"
+    assert opened_by("kuwid73", "User") == "a person"
+    assert "CI" not in opened_by("harbourbank-builder[bot]")
 
 
 def test_an_owners_pr_with_only_comments_has_no_independent_approval(fake, gh):
@@ -90,7 +105,7 @@ def test_an_owners_pr_with_only_comments_has_no_independent_approval(fake, gh):
                                          "merged_by": {"login": "kuwid73"}, "merged_at": ts()}
     fake.routes[f"{GITOPS}/pulls/10/reviews"] = [{"user": {"login": "kuwid73"}, "state": "COMMENTED"}]
     pr = ops._pull_request(gh, "kuwid73/harbourbank-gitops", 10)
-    assert pr["made_by"] == "human" and pr["independent_approval_by"] is None
+    assert pr["made_by"] == "a person" and pr["independent_approval_by"] is None
 
 
 # --- 4. deployments: every commit shipped, and where each one lands --------------------------------

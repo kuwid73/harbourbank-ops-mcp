@@ -96,6 +96,24 @@ def _touches(paths: list[str]) -> list[str]:
     return sorted(where)
 
 
+# Who opens pull requests in this lab. "A bot" hides the difference between the pipeline and the two
+# AI agents: drills of 2026-11-13 and 2026-11-16, the operator called harbourbank-builder "the CI bot".
+PR_AUTHORS = {
+    "github-actions[bot]": "the delivery pipeline (github-actions: promotion pull requests)",
+    "harbourbank-agent[bot]": "the operator agent (harbourbank-agent: proposes fixes, cannot merge)",
+    "harbourbank-builder[bot]": "the builder agent (harbourbank-builder: an AI coding assistant working with "
+                                "the engineer, cannot merge)",
+    "harbourbank-reviewer[bot]": "the reviewer agent (harbourbank-reviewer: comments only)",
+}
+
+
+def _pr_author(login: str, user_type: str | None) -> str:
+    """Who a pull request's author is, in words an answer can repeat as they stand."""
+    if login in PR_AUTHORS:
+        return PR_AUTHORS[login]
+    return f"a bot ({login})" if _maker(login, "", user_type) == "bot" else "a person"
+
+
 def _maker(author_name: str, author_email: str, author_type: str | None = None) -> str:
     """'bot' for CI and GitHub Actions, else 'human'. A push's GitHub actor is the credential's owner
     (a deploy key pushes as the repo owner), so the commit author is what tells them apart."""
@@ -683,7 +701,7 @@ def _pull_request(gh: GitHub, repo: str, number: int) -> dict:
     author = pr["user"]["login"]
     approvers = sorted({r["user"]["login"] for r in reviews if r["state"] == "APPROVED"} - {author})
     return {"number": number, "title": pr["title"], "author": author,
-            "made_by": "bot (CI)" if _maker(author, "", pr["user"].get("type")) == "bot" else "human",
+            "made_by": _pr_author(author, pr["user"].get("type")),
             "merged_by": (pr.get("merged_by") or {}).get("login"), "merged_at": pr.get("merged_at"),
             "reviews": [f"{r['user']['login']}: {r['state']}" for r in reviews],
             # GitHub forbids approving your own PR, so an approval here is always someone else's
@@ -763,7 +781,9 @@ def recent_changes(kube: Kube, gh: GitHub, env: str, days: int = 7) -> dict:
                            f"not running in {env}, though its commits are on main. "
                            f"'touches' says where each commit lands: a commit that doesn't list '{env}' "
                            f"changed nothing in {env}, even though it was part of the deployment. "
-                           f"'made_by' bot = CI pipeline; 'independent_approval_by' = who approved it"}
+                           f"a commit's 'made_by' is bot or human by its author; a pull request's 'made_by' names who "
+                           f"opened it (the pipeline, an AI agent or a person); 'independent_approval_by' = who "
+                           f"approved it"}
 
 
 def compare_environments(kube: Kube, gh: GitHub, ahead: str, behind: str) -> dict:
