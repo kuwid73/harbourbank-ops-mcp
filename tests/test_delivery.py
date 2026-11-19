@@ -117,6 +117,7 @@ GITOPS = "/repos/kuwid73/harbourbank-gitops"
 APP = "/repos/kuwid73/harbourbank-app"
 HUMAN = {"name": "Kumudu Widyaratne", "email": "53670161+kuwid73@users.noreply.github.com"}
 BOT = {"name": "harbourbank-promote", "email": "41898282+github-actions[bot]@users.noreply.github.com"}
+AGENT = {"name": "harbourbank-builder[bot]", "email": "352308485+harbourbank-builder[bot]@users.noreply.github.com"}
 
 
 def landed(sha, title, minutes_ago, files, author=HUMAN, parent="p"):
@@ -189,3 +190,24 @@ def test_platform_changes_can_be_left_out(fake, kube, gh):
     fake.routes[f"{GITOPS}/pulls/23/commits"] = pr_commits(HUMAN, 700)
     assert ops.delivery_metrics(kube, gh, "prod", include_platform=False)["deployment_frequency"]["deployments"] == 0
     assert ops.delivery_metrics(kube, gh, "prod")["deployment_frequency"]["deployments"] == 1
+
+
+def test_a_config_change_an_ai_agent_wrote_has_a_lead_time(fake, kube, gh):
+    """2026-11-17: gitops #52 and #54 were written by harbourbank-builder[bot]. Counting only people's
+    commits as changes left every agent-written deployment without a lead time."""
+    commits = [landed("a2", "dev: fail fast on a slow fraud check (#52)", 120,
+                      ["apps/harbourbank/overlays/dev/kustomization.yaml"], author=AGENT, parent="a1"),
+               landed("a1", "dev: accounts-api sha-aaaaaaa", 600, ["apps/harbourbank/overlays/dev/kustomization.yaml"],
+                      author=BOT)]
+    fake.routes[f"{GITOPS}/commits"] = commits
+    for c in commits:
+        fake.routes[f"{GITOPS}/commits/{c['sha']}"] = c
+    fake.routes[f"{GITOPS}/commits/a1/pulls"] = []                               # the pipeline pushed it directly
+    fake.routes[f"{GITOPS}/pulls/52/commits"] = pr_commits(AGENT, 180)           # written an hour before merging
+    fake.routes[f"{GITOPS}/contents/apps/harbourbank/overlays/dev/kustomization.yaml"] = overlay("sha-aaaaaaa")
+    fake.routes[f"{GITOPS}/contents/incidents"] = []
+    fake.routes["/apis/argoproj.io/v1alpha1/namespaces/argocd/applications/harbourbank-dev"] = {
+        "status": {"history": [{"revision": "a2", "deployedAt": ts(120)}]}}
+
+    by_id = {d["id"]: d for d in ops.delivery_metrics(kube, gh, "dev", days=7)["deployments_newest_first"]}
+    assert by_id["gitops#52"]["kind"] == "config" and by_id["gitops#52"]["lead_time_hours"] == 1

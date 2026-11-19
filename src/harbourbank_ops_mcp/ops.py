@@ -114,6 +114,13 @@ def _pr_author(login: str, user_type: str | None) -> str:
     return f"a bot ({login})" if _maker(login, "", user_type) == "bot" else "a person"
 
 
+def _pipeline(author_name: str, author_email: str) -> bool:
+    """A commit the delivery pipeline wrote (image pins, promotions): a step, not a change. The AI agents
+    are bots too, but what they write is a change and counts for lead time."""
+    return (author_name in ("harbourbank-ci", "harbourbank-promote", "github-actions[bot]")
+            or "+github-actions[bot]@" in author_email)
+
+
 def _maker(author_name: str, author_email: str, author_type: str | None = None) -> str:
     """'bot' for CI and GitHub Actions, else 'human'. A push's GitHub actor is the credential's owner
     (a deploy key pushes as the repo owner), so the commit author is what tells them apart."""
@@ -932,6 +939,7 @@ def _landed(gh: GitHub, sha: str) -> dict:
                        if p.get("merged_at")), None)
     return {"sha": sha, "title": title, "landed": _time(c["commit"]["committer"]["date"]),
             "made": _time(author["date"]), "made_by": _maker(author["name"], author.get("email", "")),
+            "pipeline": _pipeline(author["name"], author.get("email", "")),
             "files": [f["filename"] for f in c.get("files", [])], "parent": (c.get("parents") or [{}])[0].get("sha"),
             "pr": number}
 
@@ -1008,12 +1016,14 @@ def delivery_metrics(kube: Kube, gh: GitHub, env: str = "prod", days: int = 30,
         head = max(group, key=lambda c: c["landed"])
         number = group[0]["pr"]
         if number:   # a PR's own commits, dated when they were written
-            made = [(_time(pc["commit"]["author"]["date"]), _maker(pc["commit"]["author"]["name"],
-                                                                    pc["commit"]["author"].get("email", "")))
+            made = [(_time(pc["commit"]["author"]["date"]), _pipeline(pc["commit"]["author"]["name"],
+                                                                       pc["commit"]["author"].get("email", "")))
                     for pc in gh.get(f"/repos/{REPOS['gitops']}/pulls/{number}/commits")]
         else:
-            made = [(c["made"], c["made_by"]) for c in group]
-        changes = [t for t, by in made if by == "human"]   # a pipeline's commit is a step, not a change
+            made = [(c["made"], c["pipeline"]) for c in group]
+        # A pipeline's commit is a step, not a change. A person's or an AI agent's commit is a change
+        # (until 2026-11-17 only people's counted, so the agents' config changes had no lead time).
+        changes = [t for t, pipeline in made if not pipeline]
         kind = "config" if env in touches else "platform" if "platform" in touches else "lab tooling"
         version = None
         if f"apps/harbourbank/overlays/{env}/kustomization.yaml" in {f for c in group for f in c["files"]}:
